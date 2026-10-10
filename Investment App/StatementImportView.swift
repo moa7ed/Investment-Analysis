@@ -13,9 +13,20 @@ private struct EntryChanges {
 }
 
 struct StatementImportPreviewSheet: View {
-    let entries: [ParsedStatementEntry]
+    /// Editable so the user can override each entry's match before applying.
+    @State private var entries: [ParsedStatementEntry]
     let store: PortfolioStore
     @Environment(\.dismiss) private var dismiss
+
+    init(entries: [ParsedStatementEntry], store: PortfolioStore) {
+        _entries = State(initialValue: entries)
+        self.store = store
+    }
+
+    /// Existing investments a regular entry can be matched to (Cash is matched automatically).
+    private var matchCandidates: [Investment] {
+        store.investments.filter { $0.category.lowercased() != "cash" }
+    }
 
     /// Entries for display: cash entries are aggregated per broker, regular entries pass through.
     private var displayEntries: [ParsedStatementEntry] {
@@ -94,7 +105,7 @@ struct StatementImportPreviewSheet: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Apply") {
                         Task {
-                            await store.applyStatementEntries(entries)
+                            store.applyStatementEntries(entries)
                             await store.fetchAllPrices()
                         }
                         dismiss()
@@ -142,6 +153,19 @@ struct StatementImportPreviewSheet: View {
                 }
             }
 
+            // Lets the user correct a wrong automatic match (or force a new investment)
+            if !entry.isCash {
+                Picker("Match to", selection: matchSelection(for: entry.id)) {
+                    Text("New investment").tag(UUID?.none)
+                    ForEach(matchCandidates) { investment in
+                        Text("\(investment.name) (\(investment.symbol ?? "no symbol"))")
+                            .tag(UUID?.some(investment.id))
+                    }
+                }
+                .pickerStyle(.menu)
+                .font(.caption)
+            }
+
             // Symbol, shares, value
             HStack(spacing: 8) {
                 if let symbol = entry.symbol {
@@ -181,6 +205,20 @@ struct StatementImportPreviewSheet: View {
     }
 
     // MARK: - Helpers
+
+    /// Binding for an entry's match picker: nil means "New investment".
+    private func matchSelection(for entryID: UUID) -> Binding<UUID?> {
+        Binding(
+            get: {
+                entries.first(where: { $0.id == entryID }).flatMap { matchedInvestment(for: $0)?.id }
+            },
+            set: { newValue in
+                guard let i = entries.firstIndex(where: { $0.id == entryID }) else { return }
+                entries[i].matchedInvestmentID = newValue
+                entries[i].isForcedNew = newValue == nil
+            }
+        )
+    }
 
     private var matchedCount: Int {
         displayEntries.filter { matchedInvestment(for: $0) != nil }.count
@@ -242,12 +280,8 @@ struct StatementImportPreviewSheet: View {
     }
 
     /// Finds the existing investment that matches this entry, or nil if new.
-    /// Cash entries are matched to the "Cash" investment by name.
     private func matchedInvestment(for entry: ParsedStatementEntry) -> Investment? {
-        if (entry.category ?? "").lowercased() == "cash" {
-            return store.investments.first(where: { $0.name == "Cash" })
-        }
-        return store.matchingInvestment(forSymbol: entry.symbol)
+        store.matchingInvestment(for: entry)
     }
 
 

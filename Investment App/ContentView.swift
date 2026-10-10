@@ -22,6 +22,9 @@ struct ContentView: View {
     @State private var importError: String?
     @State private var showImportError = false
     @State private var showResetConfirmation = false
+    @State private var showSettings = false
+    @State private var showMissingKeyAlert = false
+    @State private var investmentToDelete: Investment?
 
     var body: some View {
         NavigationStack {
@@ -38,9 +41,14 @@ struct ContentView: View {
                 ToolbarItem(placement: .topBarLeading) {
                     Menu {
                         Button {
-                            showReclassifySheet = true
+                            requireAPIKey { showReclassifySheet = true }
                         } label: {
                             Label("Reclassify Sectors", systemImage: "arrow.trianglehead.2.clockwise")
+                        }
+                        Button {
+                            showSettings = true
+                        } label: {
+                            Label("Settings", systemImage: "gear")
                         }
                         Button(role: .destructive) {
                             showResetConfirmation = true
@@ -53,7 +61,7 @@ struct ContentView: View {
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
-                        showFileImporter = true
+                        requireAPIKey { showFileImporter = true }
                     } label: {
                         if isParsingStatement {
                             ProgressView()
@@ -65,12 +73,25 @@ struct ContentView: View {
                 }
             }
             .sheet(item: $selectedInvestment) { investment in
-                EditInvestmentView(investment: investment, knownSectors: store.knownSectors, exchangeRates: store.exchangeRates) { updated in
-                    store.updateInvestment(updated)
-                }
+                EditInvestmentView(
+                    investment: investment,
+                    knownSectors: store.knownSectors,
+                    exchangeRates: store.exchangeRates,
+                    onSave: { updated in store.updateInvestment(updated) },
+                    onDelete: store.canDelete(investment) ? { store.deleteInvestment(investment) } : nil
+                )
             }
             .sheet(isPresented: $showReclassifySheet) {
                 ReclassifySheet(store: store)
+            }
+            .sheet(isPresented: $showSettings) {
+                SettingsView()
+            }
+            .alert("Claude API Key Needed", isPresented: $showMissingKeyAlert) {
+                Button("Not Now", role: .cancel) { }
+                Button("Open Settings") { showSettings = true }
+            } message: {
+                Text("Add your Claude API key in Settings to import statements and classify sectors.")
             }
             .sheet(isPresented: $showAddInvestment) {
                 EditInvestmentView(
@@ -106,6 +127,21 @@ struct ContentView: View {
                 Button("OK") { }
             } message: {
                 Text(importError ?? "An unknown error occurred.")
+            }
+            .alert(
+                "Delete \(investmentToDelete?.name ?? "Investment")?",
+                isPresented: Binding(
+                    get: { investmentToDelete != nil },
+                    set: { if !$0 { investmentToDelete = nil } }
+                ),
+                presenting: investmentToDelete
+            ) { investment in
+                Button("Cancel", role: .cancel) { }
+                Button("Delete", role: .destructive) {
+                    store.deleteInvestment(investment)
+                }
+            } message: { _ in
+                Text("This removes all its holdings and can't be undone.")
             }
             .alert("Reset All Data", isPresented: $showResetConfirmation) {
                 Button("Cancel", role: .cancel) { }
@@ -163,8 +199,9 @@ struct ContentView: View {
     }
 
     private func scrollToSector(_ sector: String) {
-        // Wait for expansion animation to complete and layout to settle
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+        Task {
+            // Wait for expansion animation to complete and layout to settle
+            try? await Task.sleep(for: .milliseconds(400))
             withAnimation(.easeInOut(duration: 0.3)) {
                 // Scroll to the bottom of the expanded list, so the whole section is visible
                 scrollProxy?.scrollTo("bottom-\(sector)", anchor: .bottom)
@@ -320,6 +357,20 @@ struct ContentView: View {
                                     .contentShape(Rectangle())
                                     .onTapGesture {
                                         selectedInvestment = investment
+                                    }
+                                    .contextMenu {
+                                        Button {
+                                            selectedInvestment = investment
+                                        } label: {
+                                            Label("Edit", systemImage: "pencil")
+                                        }
+                                        if store.canDelete(investment) {
+                                            Button(role: .destructive) {
+                                                investmentToDelete = investment
+                                            } label: {
+                                                Label("Delete", systemImage: "trash")
+                                            }
+                                        }
                                     }
                             }
                         }
@@ -484,10 +535,27 @@ struct ContentView: View {
                 }
 
                 isParsingStatement = true
-                let entries = await store.parseStatement(data: data, mimeType: mimeType)
+                let entries: [ParsedStatementEntry]
+                switch await store.parseStatement(data: data, mimeType: mimeType) {
+                case .success(let parsed):
+                    entries = parsed
+                case .failure(let failure):
+                    isParsingStatement = false
+                    importError = failure.message
+                    showImportError = true
+                    return
+                }
+
+                // Cash is converted to GBP when applied, so its rates must be known before previewing
+                let cashCurrencies = Set(entries.filter(\.isCash).map { $0.currencyCode ?? "GBP" })
+                let missingRates = await store.ensureExchangeRates(for: cashCurrencies)
                 isParsingStatement = false
 
-                if let entries, !entries.isEmpty {
+                if !missingRates.isEmpty {
+                    let pairs = missingRates.sorted().map { "\($0)→GBP" }.joined(separator: ", ")
+                    importError = "Couldn't get the \(pairs) exchange rate. Check your connection and try again."
+                    showImportError = true
+                } else if !entries.isEmpty {
                     parsedEntries = entries
                     showImportPreview = true
                 } else {
@@ -507,6 +575,15 @@ struct ContentView: View {
 
     // MARK: - Helpers
 
+    /// Runs the action only if a Claude API key is saved; otherwise prompts the user to add one.
+    private func requireAPIKey(_ action: () -> Void) {
+        if APIKeyStore.hasClaudeKey {
+            action()
+        } else {
+            showMissingKeyAlert = true
+        }
+    }
+
     private func formatPct(_ value: Double) -> String {
         if value == value.rounded() {
             return String(format: "%.0f%%", value)
@@ -522,6 +599,8 @@ struct ReclassifySheet: View {
     @State private var maxSectors: Int = 8
     @State private var additionalPrompt: String = ""
     @State private var isClassifying = false
+    @State private var showError = false
+    @State private var errorMessage = ""
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -540,9 +619,14 @@ struct ReclassifySheet: View {
                     Button {
                         isClassifying = true
                         Task {
-                            await store.classifySectors(maxSectors: maxSectors, additionalPrompt: additionalPrompt, forceAll: true)
+                            let failure = await store.classifySectors(maxSectors: maxSectors, additionalPrompt: additionalPrompt, forceAll: true)
                             isClassifying = false
-                            dismiss()
+                            if let failure {
+                                errorMessage = failure.message
+                                showError = true
+                            } else {
+                                dismiss()
+                            }
                         }
                     } label: {
                         HStack {
@@ -562,6 +646,11 @@ struct ReclassifySheet: View {
             }
             .navigationTitle("Reclassify Sectors")
             .navigationBarTitleDisplayMode(.inline)
+            .alert("Reclassification Failed", isPresented: $showError) {
+                Button("OK") { }
+            } message: {
+                Text("\(errorMessage) Your existing sectors were kept.")
+            }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }

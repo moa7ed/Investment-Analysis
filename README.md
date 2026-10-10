@@ -16,7 +16,8 @@ A native iOS portfolio tracker built with SwiftUI that aggregates investments ac
 - Claude AI extracts investment data: name, symbol, shares, price, value, currency, category, broker, and account type
 - Preview screen shows matched/new/updated investments before applying
 - Cash entries from the same broker are automatically consolidated into a single GBP holding regardless of account type (ISA, Invest, etc.)
-- Symbols are stored without exchange suffixes (e.g. `VUSA` not `VUSA.L`) for cleaner data
+- One investment per company or fund: Claude matches each entry to your existing investments even when the ticker or exchange differs (e.g. `GOOG` vs `GOOGL`, `VUSA.L` vs `VUSA.AS`), with a fallback on exact symbol, base symbol, then name
+- New investments keep the full Yahoo symbol (e.g. `BP.L`) so prices come from the right exchange; existing symbols are never replaced, except a bare legacy symbol gains its suffix (`BP` → `BP.L`)
 
 ### AI Sector Classification
 - Claude AI groups investments into sectors (Tech, Crypto, Commodities, Index Funds, etc.)
@@ -81,7 +82,7 @@ A native iOS portfolio tracker built with SwiftUI that aggregates investments ac
 | API | Purpose | Authentication |
 |-----|---------|----------------|
 | Yahoo Finance Chart API | Stock prices, forex rates | None (public, User-Agent header) |
-| Anthropic Messages API | Statement parsing, sector classification | API key via `Secrets.plist` |
+| Anthropic Messages API | Statement parsing, sector classification | API key entered in Settings, stored in the Keychain |
 
 ### File Structure
 
@@ -92,30 +93,20 @@ Investment App/
   ContentView.swift         # Main UI (portfolio view, sector chart, toolbar)
   EditInvestmentView.swift  # Investment editing form
   StatementImportView.swift # Import preview and diff UI
+  SettingsView.swift        # Claude API key entry
+  APIKeyStore.swift         # Keychain storage for the API key
   Investment_AppApp.swift   # App entry point
-  Secrets.plist             # API key (git-ignored)
 ```
 
 ## Setup
 
 1. Clone the repository
-2. Create `Investment App/Secrets.plist` with your Anthropic API key:
-   ```xml
-   <?xml version="1.0" encoding="UTF-8"?>
-   <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-     "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-   <plist version="1.0">
-   <dict>
-       <key>CLAUDE_API_KEY</key>
-       <string>your-api-key-here</string>
-   </dict>
-   </plist>
-   ```
-3. Open `Investment App.xcodeproj` in Xcode
-4. Build and run on an iOS device or simulator
+2. Open `Investment App.xcodeproj` in Xcode
+3. Build and run on an iOS device or simulator
+4. In the app, open **… → Settings** and paste your Anthropic API key. It is stored in the device Keychain, never in the app bundle.
 
 ## Requirements
 
-- iOS 17+
-- Xcode 15+
+- iOS 26.2+
+- Xcode 26.2+
 - Anthropic API key (for statement import and sector classification)

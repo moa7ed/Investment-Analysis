@@ -10,65 +10,118 @@ import Observation
 
 // MARK: - Claude API
 
-private enum ClaudeAPI {
-    static let apiKey: String = {
-        guard let path = Bundle.main.path(forResource: "Secrets", ofType: "plist"),
-              let dict = NSDictionary(contentsOfFile: path),
-              let key = dict["CLAUDE_API_KEY"] as? String else {
-            fatalError("Missing Secrets.plist or CLAUDE_API_KEY. See README for setup instructions.")
+/// Why a Claude request produced no usable result.
+enum ClaudeFailure: Error {
+    case missingKey
+    /// Claude's safety filters declined the request (`stop_reason: "refusal"`).
+    case refused
+    /// Network, HTTP, or decoding failure.
+    case failed
+
+    var message: String {
+        switch self {
+        case .missingKey: "Add your Claude API key in Settings."
+        case .refused: "Claude declined to process this request."
+        case .failed: "The request to Claude failed. Check your connection and try again."
         }
-        return key
-    }()
+    }
+}
+
+private enum ClaudeAPI {
     static let model = "claude-opus-5"
     static let endpoint = URL(string: "https://api.anthropic.com/v1/messages")!
 
-    /// Sends a prompt to Claude and returns the text response, or nil on failure.
-    static func ask(_ prompt: String, maxTokens: Int = 4096) async -> String? {
-        await askWithContent([["type": "text", "text": prompt]], maxTokens: maxTokens)
+    /// The parts of a Messages API response the app reads.
+    private struct MessagesResponse: Decodable {
+        let content: [Block]
+        let stopReason: String?
+        struct Block: Decodable {
+            let type: String?
+            let text: String?
+        }
+        enum CodingKeys: String, CodingKey {
+            case content
+            case stopReason = "stop_reason"
+        }
     }
 
-    /// Sends multi-content blocks (text + images/documents) to Claude and returns the text response.
-    static func askWithContent(_ contentBlocks: [[String: Any]], maxTokens: Int = 4096) async -> String? {
+    /// Sends content blocks (text, images, PDFs) and decodes the reply as `T`.
+    /// The JSON schema is enforced by the API via structured outputs, so the reply is always valid JSON matching it.
+    static func askJSON<T: Decodable>(
+        _ contentBlocks: [[String: Any]],
+        schema: [String: Any],
+        as type: T.Type,
+        maxTokens: Int = 4096
+    ) async -> Result<T, ClaudeFailure> {
+        // Read on every call so a key added or changed in Settings takes effect immediately
+        guard let apiKey = APIKeyStore.claudeKey else { return .failure(.missingKey) }
+
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "content-type")
         request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
         request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-        request.setValue("pdfs-2024-09-25", forHTTPHeaderField: "anthropic-beta")
         request.timeoutInterval = 120
 
         let body: [String: Any] = [
             "model": model,
             "max_tokens": maxTokens,
+            "output_config": ["format": ["type": "json_schema", "schema": schema]],
             "messages": [["role": "user", "content": contentBlocks]]
         ]
 
-        guard let httpBody = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+        guard let httpBody = try? JSONSerialization.data(withJSONObject: body) else { return .failure(.failed) }
         request.httpBody = httpBody
 
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse else { return nil }
+            guard let http = response as? HTTPURLResponse else { return .failure(.failed) }
             guard http.statusCode == 200 else {
-                let body = String(data: data, encoding: .utf8) ?? "no body"
-                print("[ClaudeAPI] HTTP \(http.statusCode): \(body)")
-                return nil
+                print("[ClaudeAPI] HTTP \(http.statusCode): \(String(data: data, encoding: .utf8) ?? "no body")")
+                return .failure(.failed)
             }
 
-            struct Response: Decodable {
-                let content: [Block]
-                struct Block: Decodable {
-                    let type: String?
-                    let text: String?
-                }
+            let decoded = try JSONDecoder().decode(MessagesResponse.self, from: data)
+            switch decoded.stopReason {
+            case "refusal":
+                return .failure(.refused)
+            case "max_tokens":
+                // Output was cut off mid-JSON
+                print("[ClaudeAPI] Response truncated at max_tokens (\(maxTokens))")
+                return .failure(.failed)
+            default:
+                break
             }
 
-            let decoded = try JSONDecoder().decode(Response.self, from: data)
-            return decoded.content.first(where: { $0.type == "text" })?.text
+            guard let text = decoded.content.first(where: { $0.type == "text" })?.text else {
+                return .failure(.failed)
+            }
+            do {
+                return .success(try JSONDecoder().decode(T.self, from: Data(text.utf8)))
+            } catch {
+                print("[ClaudeAPI] Decode error: \(error)\nRaw response: \(text)")
+                return .failure(.failed)
+            }
         } catch {
             print("[ClaudeAPI] Error: \(error)")
-            return nil
+            return .failure(.failed)
         }
+    }
+
+    // MARK: Schema helpers
+
+    static func nullable(_ type: String) -> [String: Any] {
+        ["anyOf": [["type": type], ["type": "null"]]]
+    }
+
+    /// An object schema where every property is required (nullable ones may be null), as structured outputs expects.
+    static func object(_ properties: [String: Any]) -> [String: Any] {
+        [
+            "type": "object",
+            "properties": properties,
+            "required": Array(properties.keys),
+            "additionalProperties": false
+        ]
     }
 }
 
@@ -85,12 +138,22 @@ struct ParsedStatementEntry: Identifiable, Decodable {
     let category: String?
     let accountType: String?
     let broker: String?
+    /// Claude's pick from the numbered list of existing investments sent with the statement (1-based), or nil if new.
+    let matchId: Int?
+    /// The existing investment `matchId` resolves to, or the user's pick in the import preview. Not decoded.
+    var matchedInvestmentID: UUID?
+    /// True when the user chose "New investment" in the preview, overriding all automatic matching. Not decoded.
+    var isForcedNew = false
 
-    private enum CodingKeys: String, CodingKey {
-        case name, symbol, shares, value, price, currencyCode, category, accountType, broker
+    var isCash: Bool {
+        (category ?? "").lowercased() == "cash"
     }
 
-    init(name: String, symbol: String?, shares: Double, value: Double?, price: Double?, currencyCode: String?, category: String?, accountType: String?, broker: String?) {
+    private enum CodingKeys: String, CodingKey {
+        case name, symbol, shares, value, price, currencyCode, category, accountType, broker, matchId
+    }
+
+    init(name: String, symbol: String?, shares: Double, value: Double?, price: Double?, currencyCode: String?, category: String?, accountType: String?, broker: String?, matchId: Int? = nil) {
         self.name = name
         self.symbol = symbol
         self.shares = shares
@@ -100,6 +163,7 @@ struct ParsedStatementEntry: Identifiable, Decodable {
         self.category = category
         self.accountType = accountType
         self.broker = broker
+        self.matchId = matchId
     }
 }
 
@@ -135,7 +199,8 @@ class PortfolioStore {
 
     private let userDefaultsKey = "portfolio_investments"
     private let dataResetKey = "data_reset_v8_cash_consolidation"
-    static let defaultMaxSectors = 8
+    /// nonisolated so it can be used as a default argument (an immutable Int is safe from any context)
+    nonisolated static let defaultMaxSectors = 8
 
     var totalPortfolioValue: Double {
         investments.reduce(0) { $0 + valueInGBP(for: $1) }
@@ -250,6 +315,19 @@ class PortfolioStore {
         }
     }
 
+    // MARK: - Delete
+
+    /// Whether an investment can be deleted. The "Cash" investment is required for cash imports, so it's protected.
+    func canDelete(_ investment: Investment) -> Bool {
+        investment.name != "Cash"
+    }
+
+    func deleteInvestment(_ investment: Investment) {
+        guard canDelete(investment) else { return }
+        investments.removeAll { $0.id == investment.id }
+        saveToUserDefaults()
+    }
+
     // MARK: - Yahoo Finance API
 
     func fetchAllPrices() async {
@@ -265,7 +343,7 @@ class PortfolioStore {
             }
 
             // Fetch exchange rates and stock prices concurrently
-            async let ratesTask: Void = fetchExchangeRates()
+            async let ratesTask: Void = fetchExchangeRates(refreshAll: true)
 
             await withTaskGroup(of: (UUID, Double, String)?.self) { group in
                 for investment in investments where investment.symbol != nil {
@@ -292,6 +370,11 @@ class PortfolioStore {
 
             await ratesTask
 
+            // Prices may have introduced new currencies (Yahoo overrides currencyCode) — fetch any missing rates
+            if !Task.isCancelled {
+                await fetchExchangeRates()
+            }
+
             // Classify any investments that don't have a sector yet
             if !Task.isCancelled {
                 await classifySectors()
@@ -307,21 +390,20 @@ class PortfolioStore {
     /// - Parameters:
     ///   - maxSectors: Maximum number of sector categories the AI should use
     ///   - additionalPrompt: Optional extra instructions appended to the prompt
-    ///   - forceAll: If true, reclassifies all investments (clears existing sectors first)
-    func classifySectors(maxSectors: Int = defaultMaxSectors, additionalPrompt: String = "", forceAll: Bool = false) async {
-        if forceAll {
-            for i in investments.indices {
-                investments[i].sector = nil
-            }
-        }
+    ///   - forceAll: If true, reclassifies all investments; any Claude leaves out keep their current sector
+    /// - Returns: The failure if the Claude call didn't succeed, or nil on success. Sectors are only changed on success.
+    @discardableResult
+    func classifySectors(maxSectors: Int = defaultMaxSectors, additionalPrompt: String = "", forceAll: Bool = false) async -> ClaudeFailure? {
+        // Nothing is cleared up-front, so a failed request leaves existing sectors untouched
+        let targetIDs = Set(investments.filter { forceAll || $0.sector == nil }.map(\.id))
+        guard !targetIDs.isEmpty else { return nil }
 
-        let unclassified = investments.filter { $0.sector == nil }
-        guard !unclassified.isEmpty else { return }
-
-        let entries = investments.map { inv in
+        // Claude replies by list number; map numbers back to stable IDs captured before the request
+        let snapshot = investments
+        let idByNumber = Dictionary(uniqueKeysWithValues: snapshot.enumerated().map { ($0.offset + 1, $0.element.id) })
+        let entries = snapshot.map { inv in
             "\(inv.name) (\(inv.symbol ?? "N/A"), \(inv.category))"
         }
-        let unclassifiedNames = Set(unclassified.map(\.name))
 
         var prompt = """
         I have a portfolio of investments. Analyze them and:
@@ -335,43 +417,74 @@ class PortfolioStore {
         Investments:
         \(entries.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n"))
 
-        Respond with ONLY a JSON object mapping each investment name (exactly as given) to its sector name. Example:
-        {"Google": "Tech", "Bitcoin": "Crypto", "S&P 500": "Index Funds"}
-
-        Every investment must be assigned. Use at most \(maxSectors) sectors total.
+        Return one assignment per investment, using its list number. Every investment must be assigned. Use at most \(maxSectors) sectors total.
         """
 
         if !additionalPrompt.trimmingCharacters(in: .whitespaces).isEmpty {
             prompt += "\n\nAdditional instructions: \(additionalPrompt)"
         }
 
-        guard let text = await ClaudeAPI.ask(prompt) else { return }
+        struct Classification: Decodable {
+            let assignments: [Assignment]
+            struct Assignment: Decodable {
+                let number: Int
+                let sector: String
+            }
+        }
+        let schema = ClaudeAPI.object([
+            "assignments": [
+                "type": "array",
+                "items": ClaudeAPI.object([
+                    "number": ["type": "integer"],
+                    "sector": ["type": "string"]
+                ])
+            ]
+        ])
 
-        // Strip markdown code fences if present
-        let cleaned = text
-            .replacingOccurrences(of: "```json", with: "")
-            .replacingOccurrences(of: "```", with: "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let result = await ClaudeAPI.askJSON([["type": "text", "text": prompt]], schema: schema, as: Classification.self)
+        let classification: Classification
+        switch result {
+        case .success(let value): classification = value
+        case .failure(let failure): return failure
+        }
 
-        guard let jsonData = cleaned.data(using: .utf8),
-              let mapping = try? JSONSerialization.jsonObject(with: jsonData) as? [String: String]
-        else { return }
+        // Unknown list numbers are dropped
+        var sectorByID: [UUID: String] = [:]
+        for assignment in classification.assignments {
+            if let id = idByNumber[assignment.number] {
+                sectorByID[id] = assignment.sector
+            }
+        }
 
-        for (name, sectorName) in mapping {
-            if unclassifiedNames.contains(name),
-               let index = investments.firstIndex(where: { $0.name == name }) {
-                investments[index].sector = sectorName
+        // Apply all results in one pass; cash always stays in "Cash" regardless of Claude's answer
+        for i in investments.indices where targetIDs.contains(investments[i].id) {
+            if investments[i].category.lowercased() == "cash" {
+                investments[i].sector = "Cash"
+            } else if let sectorName = sectorByID[investments[i].id] {
+                investments[i].sector = sectorName
             }
         }
 
         saveToUserDefaults()
+        return nil
     }
 
     // MARK: - Statement Import
 
+    /// Categories Claude may assign to a statement entry (enforced by the response schema).
+    private static let statementCategories = ["Stock", "ETF", "Crypto", "Commodity", "Cash", "Real Estate"]
+
     /// Parses a broker statement (PDF or image) by sending it to Claude's vision API.
-    func parseStatement(data: Data, mimeType: String) async -> [ParsedStatementEntry]? {
+    func parseStatement(data: Data, mimeType: String) async -> Result<[ParsedStatementEntry], ClaudeFailure> {
         let base64String = data.base64EncodedString()
+
+        // Existing investments Claude can match entries against (Cash is handled separately)
+        let candidates = investments.filter { $0.category.lowercased() != "cash" }
+        let candidateList = candidates.isEmpty
+            ? "(none)"
+            : candidates.enumerated()
+                .map { "\($0.offset + 1). \($0.element.name) (\($0.element.symbol ?? "no symbol"))" }
+                .joined(separator: "\n")
 
         let sourceBlock: [String: Any]
         if mimeType == "application/pdf" {
@@ -407,33 +520,55 @@ class PortfolioStore {
               - Individual company stocks → "Stock"
             - "accountType": The account type, e.g. "ISA" for ISA wrappers, "Invest" for general/non-ISA investment accounts, "General" if unclear
             - "broker": The broker/platform name if identifiable (e.g., "Trading 212", "Revolut", "Schwab", "Coinbase"), or null
+            - "matchId": If this holding is the same company or fund as one of the existing investments listed below, the number of that existing investment; otherwise null. Match even when the ticker or exchange differs (e.g. GOOG vs GOOGL, VUSA.L vs VUSA.AS, or a Frankfurt listing of a US company). Only match the same company or fund - never merely a similar one or the same sector.
 
-            Respond with ONLY a JSON array. Example:
-            [{"name": "Apple", "symbol": "AAPL", "shares": 10.5, "price": 223.45, "value": 2346.23, "currencyCode": "USD", "category": "Stock", "accountType": "Invest", "broker": "Trading 212"}]
+            Existing investments:
+            \(candidateList)
 
             Important:
             - Include ALL investments/holdings shown
             - Use the exact share/unit counts shown
             - If the statement shows ISA and non-ISA sections separately, set accountType accordingly ("ISA" or "Invest")
-            - Return an empty array [] if no investments are found
+            - If several entries in this statement are the same company or fund (e.g. GOOG and GOOGL), give them the identical "name"
+            - Return an empty "entries" list if no investments are found
             """
         ]
 
-        guard let text = await ClaudeAPI.askWithContent([sourceBlock, textBlock], maxTokens: 16384) else { return nil }
+        struct StatementResponse: Decodable {
+            let entries: [ParsedStatementEntry]
+        }
+        let entrySchema = ClaudeAPI.object([
+            "name": ["type": "string"],
+            "symbol": ClaudeAPI.nullable("string"),
+            "shares": ["type": "number"],
+            "price": ClaudeAPI.nullable("number"),
+            "value": ClaudeAPI.nullable("number"),
+            "currencyCode": ClaudeAPI.nullable("string"),
+            "category": ["type": "string", "enum": Self.statementCategories],
+            "accountType": ClaudeAPI.nullable("string"),
+            "broker": ClaudeAPI.nullable("string"),
+            "matchId": ClaudeAPI.nullable("integer")
+        ])
+        let schema = ClaudeAPI.object([
+            "entries": ["type": "array", "items": entrySchema]
+        ])
 
-        let cleaned = text
-            .replacingOccurrences(of: "```json", with: "")
-            .replacingOccurrences(of: "```", with: "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let result = await ClaudeAPI.askJSON(
+            [sourceBlock, textBlock],
+            schema: schema,
+            as: StatementResponse.self,
+            maxTokens: 16384
+        )
 
-        guard let jsonData = cleaned.data(using: .utf8) else { return nil }
-
-        do {
-            return try JSONDecoder().decode([ParsedStatementEntry].self, from: jsonData)
-        } catch {
-            print("[parseStatement] JSON decode error: \(error)")
-            print("[parseStatement] Raw response: \(cleaned)")
-            return nil
+        return result.map { response in
+            var entries = response.entries
+            // Resolve Claude's 1-based matchId to the candidate's stable ID, ignoring out-of-range values
+            for i in entries.indices {
+                if let matchId = entries[i].matchId, candidates.indices.contains(matchId - 1) {
+                    entries[i].matchedInvestmentID = candidates[matchId - 1].id
+                }
+            }
+            return entries
         }
     }
 
@@ -447,8 +582,8 @@ class PortfolioStore {
         priceFetchTask = nil
 
         // Separate cash entries from regular entries
-        let cashEntries = entries.filter { ($0.category ?? "").lowercased() == "cash" }
-        let regularEntries = entries.filter { ($0.category ?? "").lowercased() != "cash" }
+        let cashEntries = entries.filter(\.isCash)
+        let regularEntries = entries.filter { !$0.isCash }
 
         // Consolidate all cash entries into the "Cash" investment
         if !cashEntries.isEmpty {
@@ -460,12 +595,14 @@ class PortfolioStore {
             let acctType = entry.accountType ?? "Invest"
             let holding = Holding(broker: brokerName, accountType: acctType, shares: entry.shares)
 
-            if let idx = matchingInvestmentIndex(forSymbol: entry.symbol) {
+            if let idx = matchingInvestmentIndex(for: entry) {
+                upgradeBareSymbol(at: idx, with: entry.symbol)
                 upsertHolding(holding, at: idx)
             } else {
+                // Keep the full Yahoo symbol (e.g. "BP.L") so prices come from the right exchange
                 let newInvestment = Investment(
                     name: entry.name,
-                    symbol: baseSymbol(entry.symbol),
+                    symbol: entry.symbol,
                     category: entry.category ?? "Stock",
                     currencyCode: entry.currencyCode ?? "GBP",
                     holdings: [holding]
@@ -511,29 +648,53 @@ class PortfolioStore {
         }
     }
 
-    /// Finds an existing investment matching the given symbol.
-    /// Compares the full symbol and the base (without exchange suffix, e.g. "VUSA" from "VUSA.L").
-    /// Returns nil if no match is found or if symbol is nil.
-    func matchingInvestment(forSymbol symbol: String?) -> Investment? {
-        guard let idx = matchingInvestmentIndex(forSymbol: symbol) else { return nil }
+    /// Finds the existing investment a statement entry belongs to, or nil if it's new.
+    /// Shared by the import preview and `applyStatementEntries` so both always agree.
+    func matchingInvestment(for entry: ParsedStatementEntry) -> Investment? {
+        guard let idx = matchingInvestmentIndex(for: entry) else { return nil }
         return investments[idx]
     }
 
-    private func matchingInvestmentIndex(forSymbol symbol: String?) -> Int? {
-        guard let symbol else { return nil }
-        let symbolLower = symbol.lowercased()
-        let symbolBase = symbolLower.split(separator: ".").first.map(String.init) ?? symbolLower
+    /// Matching order: Cash → user forced new → Claude's/user's match → exact symbol → base symbol (e.g. "VUSA" from "VUSA.L") → normalized name.
+    private func matchingInvestmentIndex(for entry: ParsedStatementEntry) -> Int? {
+        if entry.isCash {
+            return investments.firstIndex(where: { $0.name == "Cash" })
+        }
+        if entry.isForcedNew {
+            return nil
+        }
+        if let id = entry.matchedInvestmentID,
+           let idx = investments.firstIndex(where: { $0.id == id }) {
+            return idx
+        }
+        if let symbol = entry.symbol?.lowercased() {
+            if let idx = investments.firstIndex(where: { $0.symbol?.lowercased() == symbol }) {
+                return idx
+            }
+            let base = Self.baseSymbol(symbol)
+            if let idx = investments.firstIndex(where: { $0.symbol.map { Self.baseSymbol($0.lowercased()) } == base }) {
+                return idx
+            }
+        }
+        let name = Self.normalizeName(entry.name)
         return investments.firstIndex(where: {
-            guard let existing = $0.symbol?.lowercased() else { return false }
-            let existingBase = existing.split(separator: ".").first.map(String.init) ?? existing
-            return existing == symbolLower || existingBase == symbolBase
+            $0.category.lowercased() != "cash" && Self.normalizeName($0.name) == name
         })
     }
 
-    /// Strips the exchange suffix from a symbol (e.g. "VUSA.L" → "VUSA").
-    private func baseSymbol(_ symbol: String?) -> String? {
-        guard let symbol else { return nil }
-        return symbol.split(separator: ".").first.map(String.init) ?? symbol
+    /// Returns the symbol without its exchange suffix (e.g. "VUSA.L" → "VUSA").
+    private static func baseSymbol(_ symbol: String) -> String {
+        symbol.split(separator: ".").first.map(String.init) ?? symbol
+    }
+
+    /// Upgrades a legacy bare symbol (e.g. "BP") to the statement's exchange-qualified form (e.g. "BP.L").
+    /// Only adds a suffix to the same base — never replaces one ticker with a different one.
+    private func upgradeBareSymbol(at index: Int, with statementSymbol: String?) {
+        guard let existing = investments[index].symbol, !existing.contains("."),
+              let incoming = statementSymbol, incoming.contains("."),
+              Self.baseSymbol(incoming).lowercased() == existing.lowercased()
+        else { return }
+        investments[index].symbol = incoming
     }
 
     /// Upserts a holding into an investment's holdings array.
@@ -552,17 +713,37 @@ class PortfolioStore {
 
     /// Normalizes broker name for matching — lowercased, whitespace/punctuation stripped.
     static func normalizeBroker(_ name: String) -> String {
+        normalizeName(name)
+    }
+
+    /// Normalizes a name for matching — lowercased, whitespace/punctuation stripped.
+    private static func normalizeName(_ name: String) -> String {
         name.lowercased().filter { $0.isLetter || $0.isNumber }
     }
 
-    /// Fetches exchange rates to GBP for all currencies used in the portfolio.
-    private func fetchExchangeRates() async {
+    /// Currencies with a fixed rate to GBP that never need fetching.
+    private static let fixedRateCurrencies: Set<String> = ["GBP", "GBX"]
+
+    /// Fetches exchange rates to GBP for currencies used in the portfolio.
+    /// - Parameter refreshAll: If true, refetches every non-fixed currency; otherwise only currencies with no rate yet.
+    private func fetchExchangeRates(refreshAll: Bool = false) async {
         // Collect all unique currency codes that need conversion
         let currenciesNeeded = Set(investments.map(\.currencyCode))
-            .subtracting(exchangeRates.keys) // skip GBP, GBX (already known)
+            .subtracting(refreshAll ? Self.fixedRateCurrencies : Set(exchangeRates.keys))
+        await fetchRates(for: currenciesNeeded)
+    }
 
+    /// Fetches rates for any of the given currencies that don't have one yet.
+    /// - Returns: Currencies whose rate is still unavailable after fetching (e.g. offline).
+    func ensureExchangeRates(for currencies: Set<String>) async -> Set<String> {
+        await fetchRates(for: currencies.subtracting(exchangeRates.keys))
+        return currencies.subtracting(exchangeRates.keys)
+    }
+
+    /// Fetches the GBP rate for each currency concurrently and stores it in `exchangeRates`.
+    private func fetchRates(for currencies: Set<String>) async {
         await withTaskGroup(of: (String, Double)?.self) { group in
-            for currency in currenciesNeeded {
+            for currency in currencies {
                 let pair = "\(currency)GBP=X"
                 group.addTask {
                     guard let quote = await self.fetchYahooQuote(for: pair) else { return nil }
