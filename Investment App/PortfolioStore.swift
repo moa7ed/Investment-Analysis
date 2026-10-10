@@ -136,7 +136,8 @@ struct ParsedStatementEntry: Identifiable, Decodable {
     let price: Double?
     let currencyCode: String?
     let category: String?
-    let accountType: String?
+    /// Var so the import preview can apply a user-chosen account type to every entry.
+    var accountType: String?
     /// Var so the import preview can apply the user-confirmed broker to every entry.
     var broker: String?
     /// Claude's pick from the numbered list of existing investments sent with the statement (1-based), or nil if new.
@@ -149,6 +150,10 @@ struct ParsedStatementEntry: Identifiable, Decodable {
     var isCash: Bool {
         (category ?? "").lowercased() == "cash"
     }
+
+    /// Broker and account type used to key holdings — shared by the preview and apply so they always agree.
+    var resolvedBroker: String { broker ?? "Unknown" }
+    var resolvedAccountType: String { accountType ?? "Invest" }
 
     private enum CodingKeys: String, CodingKey {
         case name, symbol, shares, value, price, currencyCode, category, accountType, broker, matchId
@@ -577,9 +582,7 @@ class PortfolioStore {
         }
 
         for entry in regularEntries {
-            let brokerName = entry.broker ?? "Unknown"
-            let acctType = entry.accountType ?? "Invest"
-            let holding = Holding(broker: brokerName, accountType: acctType, shares: entry.shares)
+            let holding = Holding(broker: entry.resolvedBroker, accountType: entry.resolvedAccountType, shares: entry.shares)
 
             if let idx = matchingInvestmentIndex(for: entry) {
                 upgradeBareSymbol(at: idx, with: entry.symbol)
@@ -601,37 +604,35 @@ class PortfolioStore {
     }
 
     /// Consolidates cash entries into the "Cash" investment.
-    /// Sums all cash values (converting to GBP if needed) under a single "General" holding
-    /// for the entry's broker. Only updates if the total differs from the existing holding.
+    /// Sums cash (converted to GBP) per (broker, account type), so e.g. Revolut ISA and Revolut Invest
+    /// cash stay separate holdings — matching how regular holdings are keyed.
     private func applyCashEntries(_ cashEntries: [ParsedStatementEntry]) {
         ensureCashInvestmentExists()
         guard let cashIdx = investments.firstIndex(where: { $0.name == "Cash" }) else { return }
 
-        // Group by broker and sum values, converting to GBP
-        var totalByBroker: [String: Double] = [:]
-        for entry in cashEntries {
-            let broker = entry.broker ?? "Unknown"
-            let value = entry.value ?? (entry.shares * (entry.price ?? 1))
-            let currency = entry.currencyCode ?? "GBP"
-            let rate = exchangeRates[currency] ?? 1.0
-            let gbpValue = value * rate
-            totalByBroker[broker, default: 0] += gbpValue
+        for cash in Self.consolidatedCash(cashEntries, exchangeRates: exchangeRates) {
+            upsertHolding(Holding(broker: cash.broker, accountType: cash.accountType, shares: cash.gbpTotal), at: cashIdx)
         }
+    }
 
-        // Upsert a single "General" holding per broker
-        for (broker, gbpTotal) in totalByBroker {
-            let holding = Holding(broker: broker, accountType: "General", shares: gbpTotal)
-            let brokerNorm = Self.normalizeBroker(broker)
-            if let hIdx = investments[cashIdx].holdings.firstIndex(where: {
-                Self.normalizeBroker($0.broker) == brokerNorm && $0.accountType.lowercased() == "general"
-            }) {
-                if investments[cashIdx].holdings[hIdx].shares != gbpTotal {
-                    investments[cashIdx].holdings[hIdx].shares = gbpTotal
-                }
-            } else {
-                investments[cashIdx].holdings.append(holding)
+    /// Sums cash entries to GBP per (broker, account type). Used by both apply and the import preview.
+    static func consolidatedCash(
+        _ cashEntries: [ParsedStatementEntry],
+        exchangeRates: [String: Double]
+    ) -> [(broker: String, accountType: String, gbpTotal: Double)] {
+        var totals: [String: (broker: String, accountType: String, gbpTotal: Double)] = [:]
+        var order: [String] = []
+        for entry in cashEntries {
+            let value = entry.value ?? (entry.shares * (entry.price ?? 1))
+            let rate = exchangeRates[entry.currencyCode ?? "GBP"] ?? 1.0
+            let key = normalizeBroker(entry.resolvedBroker) + "|" + entry.resolvedAccountType.lowercased()
+            if totals[key] == nil {
+                totals[key] = (entry.resolvedBroker, entry.resolvedAccountType, 0)
+                order.append(key)
             }
+            totals[key]?.gbpTotal += value * rate
         }
+        return order.compactMap { totals[$0] }
     }
 
     /// Finds the existing investment a statement entry belongs to, or nil if it's new.

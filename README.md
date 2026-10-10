@@ -15,7 +15,7 @@ A native iOS portfolio tracker built with SwiftUI that aggregates investments ac
 - Import broker statements as PDF, PNG, or JPEG files
 - Claude AI extracts investment data: name, symbol, shares, price, value, currency, category, broker, and account type
 - Preview screen shows matched/new/updated investments before applying
-- Cash entries from the same broker are automatically consolidated into a single GBP holding regardless of account type (ISA, Invest, etc.)
+- Cash entries are consolidated into a GBP holding per broker and account type (e.g. Revolut ISA and Revolut Invest cash are kept separate)
 - One investment per company or fund: Claude matches each entry to your existing investments even when the ticker or exchange differs (e.g. `GOOG` vs `GOOGL`, `VUSA.L` vs `VUSA.AS`), with a fallback on exact symbol, base symbol, then name
 - New investments keep the full Yahoo symbol (e.g. `BP.L`) so prices come from the right exchange; existing symbols are never replaced, except a bare legacy symbol gains its suffix (`BP` → `BP.L`)
 

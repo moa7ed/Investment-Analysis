@@ -39,11 +39,24 @@ struct StatementImportPreviewSheet: View {
         brokerText.trimmingCharacters(in: .whitespaces)
     }
 
-    /// Entries with the confirmed broker applied — used for the preview and for Apply.
+    /// nil = use the account type Claude detected per entry (handles statements with both ISA and Invest sections).
+    @State private var accountTypeOverride: String?
+
+    /// Account types offered in the picker: the common ones plus any already used in the portfolio.
+    private var accountTypeOptions: [String] {
+        var seen = Set<String>()
+        return (["ISA", "Invest"] + store.investments.flatMap(\.holdings).map(\.accountType))
+            .filter { $0 != "General" && seen.insert($0.lowercased()).inserted }
+    }
+
+    /// Entries with the confirmed broker (and account type, if forced) applied — used for the preview and for Apply.
     private var effectiveEntries: [ParsedStatementEntry] {
         entries.map { entry in
             var entry = entry
             entry.broker = trimmedBroker
+            if let accountTypeOverride {
+                entry.accountType = accountTypeOverride
+            }
             return entry
         }
     }
@@ -63,35 +76,22 @@ struct StatementImportPreviewSheet: View {
         store.investments.filter { $0.category.lowercased() != "cash" }
     }
 
-    /// Entries for display: cash entries are aggregated per broker, regular entries pass through.
+    /// Entries for display: cash is aggregated per (broker, account type) exactly as Apply does; regular entries pass through.
     private var displayEntries: [ParsedStatementEntry] {
         let cashEntries = effectiveEntries.filter(\.isCash)
         let regularEntries = effectiveEntries.filter { !$0.isCash }
 
-        // Aggregate cash by broker, converting to GBP
-        var cashByBroker: [String: Double] = [:]
-        var brokerForCash: [String: String] = [:] // normalized → original
-        for entry in cashEntries {
-            let broker = entry.broker ?? "Unknown"
-            let norm = PortfolioStore.normalizeBroker(broker)
-            let value = entry.value ?? (entry.shares * (entry.price ?? 1))
-            let currency = entry.currencyCode ?? "GBP"
-            let rate = store.exchangeRates[currency] ?? 1.0
-            cashByBroker[norm, default: 0] += value * rate
-            if brokerForCash[norm] == nil { brokerForCash[norm] = broker }
-        }
-
-        let consolidatedCash: [ParsedStatementEntry] = cashByBroker.map { (norm, gbpTotal) in
+        let consolidatedCash = PortfolioStore.consolidatedCash(cashEntries, exchangeRates: store.exchangeRates).map { cash in
             ParsedStatementEntry(
                 name: "Cash",
                 symbol: nil,
-                shares: gbpTotal,
-                value: gbpTotal,
+                shares: cash.gbpTotal,
+                value: cash.gbpTotal,
                 price: 1,
                 currencyCode: "GBP",
                 category: "Cash",
-                accountType: "General",
-                broker: brokerForCash[norm]
+                accountType: cash.accountType,
+                broker: cash.broker
             )
         }
 
@@ -120,6 +120,19 @@ struct StatementImportPreviewSheet: View {
                     } else if brokerWasDetected {
                         Text("Detected from the statement. Check it's correct — it decides which holdings are updated.")
                     }
+                }
+
+                Section {
+                    Picker("Account Type", selection: $accountTypeOverride) {
+                        Text("As detected").tag(String?.none)
+                        ForEach(accountTypeOptions, id: \.self) { type in
+                            Text(type).tag(String?.some(type))
+                        }
+                    }
+                } footer: {
+                    Text(accountTypeOverride == nil
+                         ? "Uses the account type found for each entry. Choose one to apply it to the whole statement."
+                         : "Every entry, including cash, is recorded under \(accountTypeOverride ?? "").")
                 }
 
                 Section {
@@ -294,32 +307,32 @@ struct StatementImportPreviewSheet: View {
     }
 
     private var accountTypes: [String] {
-        Array(Set(entries.compactMap(\.accountType))).sorted()
+        Array(Set(effectiveEntries.map(\.resolvedAccountType))).sorted()
     }
 
     /// Computes changes between an entry and an existing investment.
     private func computeChanges(entry: ParsedStatementEntry, existing: Investment) -> EntryChanges {
         var changes: [String] = []
-        let brokerName = entry.broker ?? "Unknown"
+        let brokerName = entry.resolvedBroker
         let brokerNorm = PortfolioStore.normalizeBroker(brokerName)
+        let acctType = entry.resolvedAccountType
+        let typeLower = acctType.lowercased()
 
-        // Cash entries are already aggregated in displayEntries — compare the GBP total
-        if (entry.category ?? "").lowercased() == "cash" {
+        // Cash entries are already aggregated per (broker, account type) in displayEntries — compare the GBP total
+        if entry.isCash {
             let gbpTotal = entry.value ?? entry.shares
             if let existingHolding = existing.holdings.first(where: {
-                PortfolioStore.normalizeBroker($0.broker) == brokerNorm && $0.accountType.lowercased() == "general"
+                PortfolioStore.normalizeBroker($0.broker) == brokerNorm && $0.accountType.lowercased() == typeLower
             }) {
                 if existingHolding.shares != gbpTotal {
-                    changes.append("Cash (\(brokerName)): \(existingHolding.shares.formatted(.currency(code: "GBP").precision(.fractionLength(0)))) → \(gbpTotal.formatted(.currency(code: "GBP").precision(.fractionLength(0))))")
+                    changes.append("Cash (\(brokerName) \(acctType)): \(existingHolding.shares.formatted(.currency(code: "GBP").precision(.fractionLength(0)))) → \(gbpTotal.formatted(.currency(code: "GBP").precision(.fractionLength(0))))")
                 }
             } else {
-                changes.append("Add cash: \(brokerName) — \(gbpTotal.formatted(.currency(code: "GBP").precision(.fractionLength(0))))")
+                changes.append("Add cash: \(brokerName) · \(acctType) — \(gbpTotal.formatted(.currency(code: "GBP").precision(.fractionLength(0))))")
             }
             return EntryChanges(changes: changes)
         }
 
-        let acctType = entry.accountType ?? "Invest"
-        let typeLower = acctType.lowercased()
         if let existingHolding = existing.holdings.first(where: {
             PortfolioStore.normalizeBroker($0.broker) == brokerNorm && $0.accountType.lowercased() == typeLower
         }) {
