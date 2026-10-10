@@ -475,10 +475,8 @@ class PortfolioStore {
     /// Categories Claude may assign to a statement entry (enforced by the response schema).
     private static let statementCategories = ["Stock", "ETF", "Crypto", "Commodity", "Cash", "Real Estate"]
 
-    /// Parses a broker statement (PDF or image) by sending it to Claude's vision API.
-    func parseStatement(data: Data, mimeType: String) async -> Result<[ParsedStatementEntry], ClaudeFailure> {
-        let base64String = data.base64EncodedString()
-
+    /// Parses one broker statement (PDF, image, or text file) by sending it to Claude.
+    func parseStatement(_ source: StatementSource) async -> Result<[ParsedStatementEntry], ClaudeFailure> {
         // Existing investments Claude can match entries against (Cash is handled separately)
         let candidates = investments.filter { $0.category.lowercased() != "cash" }
         let candidateList = candidates.isEmpty
@@ -486,19 +484,6 @@ class PortfolioStore {
             : candidates.enumerated()
                 .map { "\($0.offset + 1). \($0.element.name) (\($0.element.symbol ?? "no symbol"))" }
                 .joined(separator: "\n")
-
-        let sourceBlock: [String: Any]
-        if mimeType == "application/pdf" {
-            sourceBlock = [
-                "type": "document",
-                "source": ["type": "base64", "media_type": mimeType, "data": base64String]
-            ]
-        } else {
-            sourceBlock = [
-                "type": "image",
-                "source": ["type": "base64", "media_type": mimeType, "data": base64String]
-            ]
-        }
 
         let textBlock: [String: Any] = [
             "type": "text",
@@ -555,7 +540,7 @@ class PortfolioStore {
         ])
 
         let result = await ClaudeAPI.askJSON(
-            [sourceBlock, textBlock],
+            [source.contentBlock, textBlock],
             schema: schema,
             as: StatementResponse.self,
             maxTokens: 16384

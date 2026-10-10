@@ -23,7 +23,11 @@ struct StatementImportPreviewSheet: View {
     /// Whether Claude found a broker name in the statement (affects the hint shown).
     private let brokerWasDetected: Bool
 
-    init(entries: [ParsedStatementEntry], store: PortfolioStore) {
+    /// The file this statement came from, e.g. "statement.pdf (2 of 5)".
+    private let sourceLabel: String?
+
+    init(entries: [ParsedStatementEntry], store: PortfolioStore, sourceLabel: String? = nil) {
+        self.sourceLabel = sourceLabel
         _entries = State(initialValue: entries)
         let detected = entries.compactMap(\.broker).first { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
         _brokerText = State(initialValue: detected ?? "")
@@ -119,6 +123,9 @@ struct StatementImportPreviewSheet: View {
                 }
 
                 Section {
+                    if let sourceLabel {
+                        LabeledContent("Statement", value: sourceLabel)
+                    }
                     LabeledContent("Investments Found", value: "\(displayEntries.count)")
                     LabeledContent("Matched to Existing") {
                         Text("\(matchedCount)")

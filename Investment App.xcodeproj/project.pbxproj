@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXFileReference section */
+		5A188A4A307AAB6F00629C6B /* Investment-App-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = "Investment-App-Info.plist"; sourceTree = "<group>"; };
 		5A9DB5A5305363B7004CCDC5 /* Investment App.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Investment App.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -32,6 +33,7 @@
 		5A9DB59C305363B7004CCDC5 = {
 			isa = PBXGroup;
 			children = (
+				5A188A4A307AAB6F00629C6B /* Investment-App-Info.plist */,
 				5A9DB5A7305363B7004CCDC5 /* Investment App */,
 				5A9DB5A6305363B7004CCDC5 /* Products */,
 			);
@@ -256,6 +258,8 @@
 				DEVELOPMENT_TEAM = 2GEVNAZZKJ;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "Investment-App-Info.plist";
+				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = NO;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -288,6 +292,8 @@
 				DEVELOPMENT_TEAM = 2GEVNAZZKJ;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "Investment-App-Info.plist";
+				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = NO;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
