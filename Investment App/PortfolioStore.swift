@@ -137,7 +137,8 @@ struct ParsedStatementEntry: Identifiable, Decodable {
     let currencyCode: String?
     let category: String?
     let accountType: String?
-    let broker: String?
+    /// Var so the import preview can apply the user-confirmed broker to every entry.
+    var broker: String?
     /// Claude's pick from the numbered list of existing investments sent with the statement (1-based), or nil if new.
     let matchId: Int?
     /// The existing investment `matchId` resolves to, or the user's pick in the import preview. Not decoded.
@@ -519,7 +520,7 @@ class PortfolioStore {
               - REITs, real estate → "Real Estate"
               - Individual company stocks → "Stock"
             - "accountType": The account type, e.g. "ISA" for ISA wrappers, "Invest" for general/non-ISA investment accounts, "General" if unclear
-            - "broker": The broker/platform name if identifiable (e.g., "Trading 212", "Revolut", "Schwab", "Coinbase"), or null
+            - "broker": The broker/platform name ONLY if it is explicitly written in the document (or shown as a readable logo). Do not infer it from the layout, formatting, or style of the statement. If the name does not appear, use null.
             - "matchId": If this holding is the same company or fund as one of the existing investments listed below, the number of that existing investment; otherwise null. Match even when the ticker or exchange differs (e.g. GOOG vs GOOGL, VUSA.L vs VUSA.AS, or a Frankfurt listing of a US company). Only match the same company or fund - never merely a similar one or the same sector.
 
             Existing investments:

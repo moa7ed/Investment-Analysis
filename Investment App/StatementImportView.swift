@@ -18,9 +18,40 @@ struct StatementImportPreviewSheet: View {
     let store: PortfolioStore
     @Environment(\.dismiss) private var dismiss
 
+    /// The broker every entry is recorded under. Holdings are keyed by broker, so the user confirms it before applying.
+    @State private var brokerText: String
+    /// Whether Claude found a broker name in the statement (affects the hint shown).
+    private let brokerWasDetected: Bool
+
     init(entries: [ParsedStatementEntry], store: PortfolioStore) {
         _entries = State(initialValue: entries)
+        let detected = entries.compactMap(\.broker).first { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        _brokerText = State(initialValue: detected ?? "")
+        brokerWasDetected = detected != nil
         self.store = store
+    }
+
+    private var trimmedBroker: String {
+        brokerText.trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Entries with the confirmed broker applied — used for the preview and for Apply.
+    private var effectiveEntries: [ParsedStatementEntry] {
+        entries.map { entry in
+            var entry = entry
+            entry.broker = trimmedBroker
+            return entry
+        }
+    }
+
+    /// Brokers already used in the portfolio, offered as quick picks.
+    private var knownBrokers: [String] {
+        var seen = Set<String>()
+        return store.investments
+            .flatMap(\.holdings)
+            .map(\.broker)
+            .filter { $0 != "Unknown" && seen.insert(PortfolioStore.normalizeBroker($0)).inserted }
+            .sorted()
     }
 
     /// Existing investments a regular entry can be matched to (Cash is matched automatically).
@@ -30,8 +61,8 @@ struct StatementImportPreviewSheet: View {
 
     /// Entries for display: cash entries are aggregated per broker, regular entries pass through.
     private var displayEntries: [ParsedStatementEntry] {
-        let cashEntries = entries.filter { ($0.category ?? "").lowercased() == "cash" }
-        let regularEntries = entries.filter { ($0.category ?? "").lowercased() != "cash" }
+        let cashEntries = effectiveEntries.filter(\.isCash)
+        let regularEntries = effectiveEntries.filter { !$0.isCash }
 
         // Aggregate cash by broker, converting to GBP
         var cashByBroker: [String: Double] = [:]
@@ -67,6 +98,27 @@ struct StatementImportPreviewSheet: View {
         NavigationStack {
             List {
                 Section {
+                    TextField("Broker name", text: $brokerText)
+                        .autocorrectionDisabled()
+                    if !knownBrokers.isEmpty {
+                        Menu("Choose an existing broker") {
+                            ForEach(knownBrokers, id: \.self) { broker in
+                                Button(broker) { brokerText = broker }
+                            }
+                        }
+                    }
+                } header: {
+                    Text("Broker")
+                } footer: {
+                    if trimmedBroker.isEmpty {
+                        Text("No broker name was found in the statement. Enter one to continue — it decides which holdings are updated.")
+                            .foregroundStyle(.red)
+                    } else if brokerWasDetected {
+                        Text("Detected from the statement. Check it's correct — it decides which holdings are updated.")
+                    }
+                }
+
+                Section {
                     LabeledContent("Investments Found", value: "\(displayEntries.count)")
                     LabeledContent("Matched to Existing") {
                         Text("\(matchedCount)")
@@ -85,9 +137,6 @@ struct StatementImportPreviewSheet: View {
                     if !accountTypes.isEmpty {
                         LabeledContent("Account Types", value: accountTypes.joined(separator: ", "))
                     }
-                    if let broker = dominantBroker {
-                        LabeledContent("Broker Detected", value: broker)
-                    }
                 }
 
                 Section("Investments") {
@@ -104,12 +153,14 @@ struct StatementImportPreviewSheet: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Apply") {
+                        let toApply = effectiveEntries
                         Task {
-                            store.applyStatementEntries(entries)
+                            store.applyStatementEntries(toApply)
                             await store.fetchAllPrices()
                         }
                         dismiss()
                     }
+                    .disabled(trimmedBroker.isEmpty)
                 }
             }
         }
@@ -237,10 +288,6 @@ struct StatementImportPreviewSheet: View {
 
     private var accountTypes: [String] {
         Array(Set(entries.compactMap(\.accountType))).sorted()
-    }
-
-    private var dominantBroker: String? {
-        entries.compactMap(\.broker).first
     }
 
     /// Computes changes between an entry and an existing investment.
