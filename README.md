@@ -16,6 +16,9 @@ A native iOS portfolio tracker built with SwiftUI that aggregates investments ac
 - Claude AI extracts investment data: name, symbol, shares, price, value, currency, category, broker, and account type
 - Preview screen shows matched/new/updated investments before applying
 - Cash entries are consolidated into a GBP holding per broker and account type (e.g. Revolut ISA and Revolut Invest cash are kept separate)
+- Precious metals held as ounces (XAU, XAG, …) are priced via Yahoo futures symbols (`GC=F`, `SI=F`, …)
+- Holdings Yahoo can't price block the import until you choose: enter a price, use the statement's value ÷ units, or enter a ticker (verified live, and remembered for future imports)
+- Investments without a live price are flagged "No live price"; manually priced ones show "Manual"
 - One investment per company or fund: Claude matches each entry to your existing investments even when the ticker or exchange differs (e.g. `GOOG` vs `GOOGL`, `VUSA.L` vs `VUSA.AS`), with a fallback on exact symbol, base symbol, then name
 - New investments keep the full Yahoo symbol (e.g. `BP.L`) so prices come from the right exchange; existing symbols are never replaced, except a bare legacy symbol gains its suffix (`BP` → `BP.L`)
 

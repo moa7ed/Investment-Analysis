@@ -490,9 +490,12 @@ struct ContentView: View {
 
         return HStack {
             VStack(alignment: .leading, spacing: 2) {
-                Text(investment.name)
-                    .font(.subheadline)
-                    .lineLimit(1)
+                HStack(spacing: 4) {
+                    Text(investment.name)
+                        .font(.subheadline)
+                        .lineLimit(1)
+                    priceStatusBadge(for: investment)
+                }
                 HStack(spacing: 4) {
                     Text(formatPct(currentPct))
                         .foregroundStyle(statusColor)
@@ -516,6 +519,26 @@ struct ContentView: View {
         .padding(.vertical, 6)
         .padding(.horizontal, 12)
         .padding(.leading, 22)
+    }
+
+    /// Flags investments whose value isn't from a live market price, so stale or missing values are visible.
+    @ViewBuilder
+    private func priceStatusBadge(for investment: Investment) -> some View {
+        switch store.priceStatus(for: investment) {
+        case .noLivePrice:
+            Label("No live price", systemImage: "exclamationmark.triangle.fill")
+                .font(.caption2)
+                .foregroundStyle(.orange)
+                .labelStyle(.titleAndIcon)
+        case .manual:
+            Text("Manual")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 4)
+                .background(Color(.systemGray5), in: Capsule())
+        case .live:
+            EmptyView()
+        }
     }
 
     // MARK: - Total Card

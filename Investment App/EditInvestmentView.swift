@@ -247,7 +247,7 @@ struct EditInvestmentView: View {
 
 /// Parses and formats numbers using the device's region settings (decimal separator, grouping, digits).
 /// Parsing is strict: text that isn't entirely a valid non-negative number returns nil rather than a partial value.
-private enum NumberText {
+enum NumberText {
     private static let parser: NumberFormatter = {
         let formatter = NumberFormatter()
         formatter.numberStyle = .decimal

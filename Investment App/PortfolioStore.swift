@@ -127,10 +127,22 @@ private enum ClaudeAPI {
 
 // MARK: - Statement Import Models
 
+/// A ticker the user confirmed for a holding Yahoo couldn't price, reused on future imports.
+struct TickerOverride: Codable {
+    /// What the statement showed, e.g. "Gold (XAU)" — used in the Claude prompt
+    let label: String
+    let ticker: String
+}
+
 struct ParsedStatementEntry: Identifiable, Decodable {
     let id = UUID()
     let name: String
-    let symbol: String?
+    /// Var so a remembered or user-entered ticker can replace Claude's symbol.
+    var symbol: String?
+    /// Price the user chose in the preview for a holding with no live price (in `currencyCode`). Not decoded.
+    var manualPrice: Double?
+    /// True when the user entered this ticker in the preview, so it replaces an existing investment's symbol. Not decoded.
+    var symbolConfirmedByUser = false
     let shares: Double
     let value: Double?
     let price: Double?
@@ -202,8 +214,13 @@ class PortfolioStore {
     var hasFetchedOnce = false
     var exchangeRates: [String: Double] = ["GBP": 1.0, "GBX": 0.01]
     private var priceFetchTask: Task<Void, Never>?
+    /// Investments whose symbol returned no price on the last refresh (not persisted — rechecked every refresh).
+    private var fetchFailedIDs = Set<UUID>()
+    /// Tickers the user confirmed during import, keyed by the statement's normalized symbol/name.
+    private(set) var tickerOverrides: [String: TickerOverride] = [:]
 
     private let userDefaultsKey = "portfolio_investments"
+    private let tickerOverridesKey = "ticker_overrides"
     private let dataResetKey = "data_reset_v8_cash_consolidation"
     /// nonisolated so it can be used as a default argument (an immutable Int is safe from any context)
     nonisolated static let defaultMaxSectors = 8
@@ -258,6 +275,7 @@ class PortfolioStore {
     init() {
         resetDataIfNeeded()
         loadFromUserDefaults()
+        loadTickerOverrides()
         ensureCashInvestmentExists()
         debugPrintInvestments()
     }
@@ -321,6 +339,53 @@ class PortfolioStore {
         }
     }
 
+    // MARK: - Price Status
+
+    enum PriceStatus {
+        case live
+        /// Valued from a manual price or value the user entered
+        case manual
+        /// No symbol, or the symbol returned no price on the last refresh
+        case noLivePrice
+    }
+
+    func priceStatus(for investment: Investment) -> PriceStatus {
+        if investment.manualPrice != nil || investment.manualValue != nil { return .manual }
+        if investment.category.lowercased() == "cash" { return .live }
+        if investment.symbol == nil || fetchFailedIDs.contains(investment.id) || investment.apiPrice == nil {
+            return .noLivePrice
+        }
+        return .live
+    }
+
+    /// Whether Yahoo returns a price for the symbol (also tries the usual exchange suffixes).
+    func hasLivePrice(symbol: String) async -> Bool {
+        await fetchYahooQuote(for: symbol) != nil
+    }
+
+    // MARK: - Ticker Overrides
+
+    /// Remembers a user-confirmed ticker for a statement holding, so future imports use it automatically.
+    func rememberTicker(_ ticker: String, for entry: ParsedStatementEntry) {
+        let label = entry.symbol.map { "\(entry.name) (\($0))" } ?? entry.name
+        tickerOverrides[Self.overrideKey(for: entry)] = TickerOverride(label: label, ticker: ticker)
+        if let data = try? JSONEncoder().encode(tickerOverrides) {
+            UserDefaults.standard.set(data, forKey: tickerOverridesKey)
+        }
+    }
+
+    private func loadTickerOverrides() {
+        guard let data = UserDefaults.standard.data(forKey: tickerOverridesKey),
+              let decoded = try? JSONDecoder().decode([String: TickerOverride].self, from: data)
+        else { return }
+        tickerOverrides = decoded
+    }
+
+    /// Keyed on what the statement shows (its symbol if any, else the name), normalized.
+    private static func overrideKey(for entry: ParsedStatementEntry) -> String {
+        normalizeName(entry.symbol ?? entry.name)
+    }
+
     // MARK: - Delete
 
     /// Whether an investment can be deleted. The "Cash" investment is required for cash imports, so it's protected.
@@ -351,27 +416,34 @@ class PortfolioStore {
             // Fetch exchange rates and stock prices concurrently
             async let ratesTask: Void = fetchExchangeRates(refreshAll: true)
 
-            await withTaskGroup(of: (UUID, Double, String)?.self) { group in
-                for investment in investments where investment.symbol != nil {
+            var failedIDs = Set<UUID>()
+            await withTaskGroup(of: (UUID, (price: Double, currency: String)?).self) { group in
+                for investment in investments {
+                    guard let symbol = investment.symbol else { continue }
                     let id = investment.id
-                    let symbol = investment.symbol!
                     group.addTask {
-                        guard let quote = await self.fetchYahooQuote(for: symbol) else {
-                            print("[fetchAllPrices] No price found for symbol: \(symbol)")
-                            return nil
-                        }
-                        return (id, quote.price, quote.currency)
+                        let quote = await self.fetchYahooQuote(for: symbol)
+                        if quote == nil { print("[fetchAllPrices] No price found for symbol: \(symbol)") }
+                        return (id, quote)
                     }
                 }
 
-                for await result in group {
+                for await (id, quote) in group {
                     guard !Task.isCancelled else { break }
-                    if let (id, price, currency) = result,
-                       let index = investments.firstIndex(where: { $0.id == id }) {
-                        investments[index].apiPrice = price
-                        investments[index].currencyCode = currency
+                    guard let index = investments.firstIndex(where: { $0.id == id }) else { continue }
+                    guard let quote else {
+                        failedIDs.insert(id)
+                        continue
+                    }
+                    investments[index].apiPrice = quote.price
+                    // A manual price/value is in the investment's own currency — don't switch it underneath
+                    if investments[index].manualPrice == nil && investments[index].manualValue == nil {
+                        investments[index].currencyCode = quote.currency
                     }
                 }
+            }
+            if !Task.isCancelled {
+                fetchFailedIDs = failedIDs
             }
 
             await ratesTask
@@ -490,6 +562,12 @@ class PortfolioStore {
                 .map { "\($0.offset + 1). \($0.element.name) (\($0.element.symbol ?? "no symbol"))" }
                 .joined(separator: "\n")
 
+        // Tickers the user confirmed on earlier imports, for holdings Yahoo couldn't price as Claude suggested
+        let confirmedTickerList = tickerOverrides.isEmpty
+            ? ""
+            : "\nUser-confirmed tickers (always use these symbols for these holdings):\n"
+                + tickerOverrides.values.map { "- \($0.label) → \($0.ticker)" }.sorted().joined(separator: "\n")
+
         let textBlock: [String: Any] = [
             "type": "text",
             "text": """
@@ -497,11 +575,11 @@ class PortfolioStore {
 
             For each investment, provide:
             - "name": The investment name (e.g., "Apple", "Vanguard S&P 500 ETF")
-            - "symbol": The Yahoo Finance ticker symbol (e.g., "AAPL", "VUSA.L", "VOW3.DE"), or null. If the statement shows a different symbol, convert it to the Yahoo Finance equivalent. Include exchange suffixes for non-US stocks (e.g., ".L" for London, ".DE" for Frankfurt, ".PA" for Paris).
-            - "shares": Number of shares/units held (as a number)
+            - "symbol": The Yahoo Finance ticker symbol (e.g., "AAPL", "VUSA.L", "VOW3.DE"), or null. If the statement shows a different symbol, convert it to the Yahoo Finance equivalent. Include exchange suffixes for non-US stocks (e.g., ".L" for London, ".DE" for Frankfurt, ".PA" for Paris). Precious metals held directly as ounces/units (shown as XAU, XAG, XPT, XPD, or "gold"/"silver" balances) have no stock ticker: use the Yahoo futures symbol — gold "GC=F", silver "SI=F", platinum "PL=F", palladium "PA=F". Never use XAU/XAG/XPT/XPD as a symbol. Exchange-listed gold/silver funds (ETCs/ETFs such as "SGLN.L") keep their own ticker.
+            - "shares": Number of shares/units held (as a number). For precious metals held directly, the number of troy ounces (e.g. 3.514292 for "3.514292 XAU")
             - "price": The price per share/unit if shown (as a number), or null
             - "value": Total value if shown (as a number), or null. If not shown but price and shares are available, calculate it.
-            - "currencyCode": The currency code (e.g., "USD", "GBP", "EUR", "GBX"). Use the currency shown in the statement. Default to "GBP" if unclear.
+            - "currencyCode": The currency code (e.g., "USD", "GBP", "EUR", "GBX"). Use the currency the price/value is shown in on the statement. Default to "GBP" if unclear. Never use a metal code (XAU, XAG, XPT, XPD) as the currency.
             - "category": Classify the investment into one of these categories: "Stock", "ETF", "Crypto", "Commodity", "Cash", "Real Estate". Rules:
               - Cryptocurrencies (Bitcoin, Ethereum, Solana, etc.) or symbols ending in "-USD" → "Crypto"
               - ETFs, index funds, iShares, Vanguard funds, or London-listed funds (.L suffix) → "ETF"
@@ -515,6 +593,7 @@ class PortfolioStore {
 
             Existing investments:
             \(candidateList)
+            \(confirmedTickerList)
 
             Important:
             - Include ALL investments/holdings shown
@@ -558,6 +637,10 @@ class PortfolioStore {
                 if let matchId = entries[i].matchId, candidates.indices.contains(matchId - 1) {
                     entries[i].matchedInvestmentID = candidates[matchId - 1].id
                 }
+                // Enforce user-confirmed tickers even if Claude didn't follow the prompt
+                if let override = tickerOverrides[Self.overrideKey(for: entries[i])] {
+                    entries[i].symbol = override.ticker
+                }
             }
             return entries
         }
@@ -585,17 +668,26 @@ class PortfolioStore {
             let holding = Holding(broker: entry.resolvedBroker, accountType: entry.resolvedAccountType, shares: entry.shares)
 
             if let idx = matchingInvestmentIndex(for: entry) {
-                upgradeBareSymbol(at: idx, with: entry.symbol)
+                if entry.symbolConfirmedByUser {
+                    investments[idx].symbol = entry.symbol
+                } else {
+                    upgradeBareSymbol(at: idx, with: entry.symbol)
+                }
+                if let manualPrice = entry.manualPrice {
+                    investments[idx].manualPrice = manualPrice
+                    investments[idx].currencyCode = entry.currencyCode ?? investments[idx].currencyCode
+                }
                 upsertHolding(holding, at: idx)
             } else {
                 // Keep the full Yahoo symbol (e.g. "BP.L") so prices come from the right exchange
-                let newInvestment = Investment(
+                var newInvestment = Investment(
                     name: entry.name,
                     symbol: entry.symbol,
                     category: entry.category ?? "Stock",
                     currencyCode: entry.currencyCode ?? "GBP",
                     holdings: [holding]
                 )
+                newInvestment.manualPrice = entry.manualPrice
                 investments.append(newInvestment)
             }
         }

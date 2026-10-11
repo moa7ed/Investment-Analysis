@@ -12,6 +12,29 @@ private struct EntryChanges {
     static let empty = EntryChanges(changes: [])
 }
 
+/// Whether a holding will have a live price after import.
+private enum PriceCheck {
+    case notNeeded, checking, ok, missing
+}
+
+/// How the user chose to price a holding Yahoo couldn't price.
+private struct PriceResolution {
+    enum Mode: Hashable {
+        case manualPrice, fromValue, ticker
+    }
+    var mode: Mode?
+    var priceText = ""
+    var tickerText = ""
+    /// The ticker text that last passed the Yahoo check
+    var verifiedTicker: String?
+    var isCheckingTicker = false
+    var tickerFailed = false
+
+    var trimmedTicker: String {
+        tickerText.trimmingCharacters(in: .whitespaces).uppercased()
+    }
+}
+
 struct StatementImportPreviewSheet: View {
     /// Editable so the user can override each entry's match before applying.
     @State private var entries: [ParsedStatementEntry]
@@ -41,6 +64,11 @@ struct StatementImportPreviewSheet: View {
 
     /// nil = use the account type Claude detected per entry (handles statements with both ISA and Invest sections).
     @State private var accountTypeOverride: String?
+
+    /// Yahoo live-price results by symbol (true = a price was found).
+    @State private var livePriceBySymbol: [String: Bool] = [:]
+    /// The user's chosen fix for each entry that has no live price, keyed by entry ID.
+    @State private var priceResolutions: [UUID: PriceResolution] = [:]
 
     /// Account types offered in the picker: the common ones plus any already used in the portfolio.
     private var accountTypeOptions: [String] {
@@ -165,6 +193,10 @@ struct StatementImportPreviewSheet: View {
                     }
                 }
             }
+            // Re-runs whenever new symbols need checking (e.g. after changing a match)
+            .task(id: symbolsToCheck) {
+                await checkLivePrices(symbolsToCheck)
+            }
             .navigationTitle("Import Preview")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -173,14 +205,14 @@ struct StatementImportPreviewSheet: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Apply") {
-                        let toApply = effectiveEntries
+                        let toApply = entriesForApply()
                         Task {
                             store.applyStatementEntries(toApply)
                             await store.fetchAllPrices()
                         }
                         dismiss()
                     }
-                    .disabled(trimmedBroker.isEmpty)
+                    .disabled(trimmedBroker.isEmpty || hasUnresolvedPrices)
                 }
             }
         }
@@ -271,6 +303,21 @@ struct StatementImportPreviewSheet: View {
                     }
                     .padding(.top, 2)
             }
+
+            // Holdings Yahoo can't price must be resolved before Apply
+            switch priceCheck(for: entry) {
+            case .checking:
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.mini)
+                    Text("Checking live price…")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            case .missing:
+                priceResolutionView(for: entry)
+            case .ok, .notNeeded:
+                EmptyView()
+            }
         }
         .padding(.vertical, 2)
     }
@@ -349,6 +396,186 @@ struct StatementImportPreviewSheet: View {
     /// Finds the existing investment that matches this entry, or nil if new.
     private func matchedInvestment(for entry: ParsedStatementEntry) -> Investment? {
         store.matchingInvestment(for: entry)
+    }
+
+    // MARK: - Live Price Check
+
+    /// The symbol this entry will be priced with after import, or nil if it won't have one.
+    private func pricingSymbol(for entry: ParsedStatementEntry) -> String? {
+        // A matched investment keeps its own symbol; a new one uses the statement's
+        if let matched = matchedInvestment(for: entry) {
+            return matched.symbol
+        }
+        return entry.symbol
+    }
+
+    private func priceCheck(for entry: ParsedStatementEntry) -> PriceCheck {
+        guard !entry.isCash else { return .notNeeded }
+        if let matched = matchedInvestment(for: entry) {
+            switch store.priceStatus(for: matched) {
+            case .manual: return .notNeeded // already priced manually
+            case .live: return .ok
+            case .noLivePrice: break
+            }
+        }
+        guard let symbol = pricingSymbol(for: entry) else { return .missing }
+        switch livePriceBySymbol[symbol] {
+        case nil: return .checking
+        case true?: return .ok
+        case false?: return .missing
+        }
+    }
+
+    /// Symbols still waiting for a Yahoo check — drives the `.task` that checks them.
+    private var symbolsToCheck: [String] {
+        Array(Set(displayEntries.filter { priceCheck(for: $0) == .checking }.compactMap(pricingSymbol))).sorted()
+    }
+
+    private func checkLivePrices(_ symbols: [String]) async {
+        await withTaskGroup(of: (String, Bool).self) { group in
+            for symbol in symbols {
+                group.addTask { (symbol, await store.hasLivePrice(symbol: symbol)) }
+            }
+            for await (symbol, hasPrice) in group {
+                livePriceBySymbol[symbol] = hasPrice
+            }
+        }
+    }
+
+    /// Price per unit from the statement's value, if it has one.
+    private func valuePerUnit(for entry: ParsedStatementEntry) -> Double? {
+        guard let value = entry.value, entry.shares > 0 else { return nil }
+        return value / entry.shares
+    }
+
+    private func isResolved(_ entry: ParsedStatementEntry) -> Bool {
+        guard let resolution = priceResolutions[entry.id], let mode = resolution.mode else { return false }
+        switch mode {
+        case .manualPrice: return (NumberText.parse(resolution.priceText) ?? 0) > 0
+        case .fromValue: return valuePerUnit(for: entry) != nil
+        case .ticker: return resolution.verifiedTicker != nil && resolution.verifiedTicker == resolution.trimmedTicker
+        }
+    }
+
+    /// True while prices are being checked or any unpriced holding still needs the user's choice.
+    private var hasUnresolvedPrices: Bool {
+        displayEntries.contains { entry in
+            switch priceCheck(for: entry) {
+            case .checking: true
+            case .missing: !isResolved(entry)
+            case .ok, .notNeeded: false
+            }
+        }
+    }
+
+    private func resolution(_ id: UUID) -> Binding<PriceResolution> {
+        Binding(
+            get: { priceResolutions[id] ?? PriceResolution() },
+            set: { priceResolutions[id] = $0 }
+        )
+    }
+
+    private func checkTicker(for id: UUID) async {
+        let ticker = resolution(id).wrappedValue.trimmedTicker
+        guard !ticker.isEmpty else { return }
+        priceResolutions[id, default: PriceResolution()].isCheckingTicker = true
+        let hasPrice = await store.hasLivePrice(symbol: ticker)
+        priceResolutions[id, default: PriceResolution()].isCheckingTicker = false
+        priceResolutions[id, default: PriceResolution()].verifiedTicker = hasPrice ? ticker : nil
+        priceResolutions[id, default: PriceResolution()].tickerFailed = !hasPrice
+    }
+
+    /// Entries ready for Apply: the user's price choices are written in, and confirmed tickers are remembered.
+    private func entriesForApply() -> [ParsedStatementEntry] {
+        effectiveEntries.map { entry in
+            guard priceCheck(for: entry) == .missing,
+                  let resolution = priceResolutions[entry.id], let mode = resolution.mode
+            else { return entry }
+
+            var entry = entry
+            switch mode {
+            case .manualPrice:
+                entry.manualPrice = NumberText.parse(resolution.priceText)
+            case .fromValue:
+                entry.manualPrice = valuePerUnit(for: entry)
+            case .ticker:
+                if let ticker = resolution.verifiedTicker {
+                    store.rememberTicker(ticker, for: entry)
+                    entry.symbol = ticker
+                    entry.symbolConfirmedByUser = true
+                }
+            }
+            return entry
+        }
+    }
+
+    @ViewBuilder
+    private func priceResolutionView(for entry: ParsedStatementEntry) -> some View {
+        let binding = resolution(entry.id)
+        let currency = entry.currencyCode ?? "GBP"
+        VStack(alignment: .leading, spacing: 6) {
+            Label(
+                "No live price for \(pricingSymbol(for: entry) ?? entry.name). Choose how to price it:",
+                systemImage: "exclamationmark.triangle.fill"
+            )
+            .font(.caption)
+            .foregroundStyle(.orange)
+
+            Picker("Price source", selection: binding.mode) {
+                Text("Choose…").tag(PriceResolution.Mode?.none)
+                Text("Enter a price").tag(PriceResolution.Mode?.some(.manualPrice))
+                if valuePerUnit(for: entry) != nil {
+                    Text("Value ÷ units").tag(PriceResolution.Mode?.some(.fromValue))
+                }
+                Text("Enter a ticker").tag(PriceResolution.Mode?.some(.ticker))
+            }
+            .pickerStyle(.menu)
+            .font(.caption)
+
+            switch binding.wrappedValue.mode {
+            case .manualPrice?:
+                TextField("Price per unit in \(currency)", text: binding.priceText)
+                    .keyboardType(.decimalPad)
+                    .textFieldStyle(.roundedBorder)
+                if NumberText.isInvalid(binding.wrappedValue.priceText) {
+                    Text("Invalid number").font(.caption).foregroundStyle(.red)
+                }
+            case .fromValue?:
+                if let value = entry.value, let perUnit = valuePerUnit(for: entry) {
+                    Text("\(value.formatted(.currency(code: currency))) ÷ \(entry.shares.formatted()) = \(perUnit.formatted(.currency(code: currency))) per unit")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            case .ticker?:
+                HStack {
+                    TextField("Yahoo ticker, e.g. GC=F", text: binding.tickerText)
+                        .textInputAutocapitalization(.characters)
+                        .autocorrectionDisabled()
+                        .textFieldStyle(.roundedBorder)
+                    if binding.wrappedValue.isCheckingTicker {
+                        ProgressView()
+                    } else {
+                        Button("Check") {
+                            Task { await checkTicker(for: entry.id) }
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(binding.wrappedValue.trimmedTicker.isEmpty)
+                    }
+                }
+                if let verified = binding.wrappedValue.verifiedTicker, verified == binding.wrappedValue.trimmedTicker {
+                    Label("\(verified) has a live price — it will be remembered for future imports", systemImage: "checkmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.green)
+                } else if binding.wrappedValue.tickerFailed {
+                    Text("No price found for that ticker on Yahoo Finance.")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+            case nil:
+                EmptyView()
+            }
+        }
+        .padding(.top, 4)
     }
 
 
