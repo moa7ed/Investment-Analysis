@@ -11,6 +11,9 @@ struct Holding: Codable, Hashable {
     var broker: String      // e.g. "Trading 212", "Revolut", "Coinbase"
     var accountType: String // e.g. "ISA", "Invest", "General"
     var shares: Double
+
+    /// Account types offered in pickers. Holdings can still carry other types (e.g. from older imports).
+    static let standardAccountTypes = ["ISA", "Invest", "General"]
 }
 
 struct Investment: Identifiable, Codable, Hashable {

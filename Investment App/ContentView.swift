@@ -20,14 +20,24 @@ private struct ImportPreview: Identifiable {
     let id = UUID()
     let entries: [ParsedStatementEntry]
     let label: String
+    let source: StatementSource
 }
 
 struct ContentView: View {
-    @State private var store = PortfolioStore()
+    @State private var store: PortfolioStore
+
+    /// Statements to import as soon as the view appears (used by UI tests).
+    private let initialImports: [StatementSource]
+
+    init(store: PortfolioStore, initialImports: [StatementSource] = []) {
+        _store = State(initialValue: store)
+        self.initialImports = initialImports
+    }
     @State private var selectedInvestment: Investment?
     @State private var expandedSectors: Set<String> = []
     @State private var scrollProxy: ScrollViewProxy?
     @State private var showReclassifySheet = false
+    @State private var showTargets = false
     @State private var showAddInvestment = false
     @State private var showFileImporter = false
     @State private var showPhotosPicker = false
@@ -45,6 +55,8 @@ struct ContentView: View {
     @State private var showSettings = false
     @State private var showMissingKeyAlert = false
     @State private var investmentToDelete: Investment?
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var searchText = ""
 
     var body: some View {
         NavigationStack {
@@ -57,9 +69,16 @@ struct ContentView: View {
             }
             .navigationTitle("Portfolio")
             .navigationBarTitleDisplayMode(.inline)
+            .searchable(text: $searchText, prompt: "Name or symbol")
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Menu {
+                        Button {
+                            showTargets = true
+                        } label: {
+                            Label("Update Targets", systemImage: "target")
+                        }
+                        .accessibilityIdentifier("menu.targets")
                         Button {
                             requireAPIKey { showReclassifySheet = true }
                         } label: {
@@ -78,6 +97,7 @@ struct ContentView: View {
                     } label: {
                         Image(systemName: "ellipsis.circle")
                     }
+                    .accessibilityIdentifier("menu.more")
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
@@ -99,6 +119,7 @@ struct ContentView: View {
                         }
                     }
                     .disabled(isImportRunning)
+                    .accessibilityIdentifier("menu.import")
                 }
             }
             .sheet(item: $selectedInvestment) { investment in
@@ -109,6 +130,9 @@ struct ContentView: View {
                     onSave: { updated in store.updateInvestment(updated) },
                     onDelete: store.canDelete(investment) ? { store.deleteInvestment(investment) } : nil
                 )
+            }
+            .sheet(isPresented: $showTargets) {
+                TargetsView(store: store)
             }
             .sheet(isPresented: $showReclassifySheet) {
                 ReclassifySheet(store: store)
@@ -132,11 +156,33 @@ struct ContentView: View {
                     store.saveToUserDefaults()
                 }
             }
+            // Drop a filter whose broker or account type no longer exists (e.g. after a reset or delete)
+            .onChange(of: store.filterBrokers) { _, brokers in
+                if let broker = store.brokerFilter,
+                   !brokers.contains(where: { PortfolioStore.normalizeBroker($0) == PortfolioStore.normalizeBroker(broker) }) {
+                    store.brokerFilter = nil
+                }
+            }
+            .onChange(of: store.filterAccountTypes) { _, types in
+                if let type = store.accountTypeFilter, !types.contains(where: { $0.lowercased() == type.lowercased() }) {
+                    store.accountTypeFilter = nil
+                }
+            }
             .refreshable {
                 await store.fetchAllPrices()
             }
             .task {
+                if !initialImports.isEmpty {
+                    enqueueImports(initialImports.map { .source($0) })
+                }
+                importSharedInbox()
                 await store.fetchAllPrices()
+            }
+            // Statements sent from the Share extension while the app was in the background
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active {
+                    importSharedInbox()
+                }
             }
             .fileImporter(
                 isPresented: $showFileImporter,
@@ -151,12 +197,17 @@ struct ContentView: View {
                 photoSelection = []
                 Task { await handlePhotoImport(items) }
             }
-            // Files shared to the app ("Open in Investment App" in the share sheet)
+            // investmentapp://import comes from the Share extension; anything else is a file
+            // shared to the app ("Open in Investment App" in the share sheet)
             .onOpenURL { url in
-                handleSharedFile(url)
+                if url.scheme == SharedInbox.urlScheme {
+                    importSharedInbox()
+                } else {
+                    handleSharedFile(url)
+                }
             }
             .sheet(item: $currentPreview, onDismiss: processNextImport) { preview in
-                StatementImportPreviewSheet(entries: preview.entries, store: store, sourceLabel: preview.label)
+                StatementImportPreviewSheet(entries: preview.entries, store: store, sourceLabel: preview.label, source: preview.source)
             }
             .alert("Import Error", isPresented: $showImportError) {
                 // Continue with the next queued statement once the error is acknowledged
@@ -211,13 +262,25 @@ struct ContentView: View {
                 VStack(spacing: 20) {
                     portfolioHeader
 
-                    sectorBarChart
+                    if !store.targetsAddUpTo100 {
+                        targetWarning
+                            .padding(.horizontal)
+                    }
+
+                    filterBar
                         .padding(.horizontal)
 
-                    sectorList
+                    if isSearching {
+                        searchResults
+                    } else {
+                        sectorBarChart
+                            .padding(.horizontal)
 
-                    totalCard
-                        .padding(.horizontal)
+                        sectorList
+
+                        totalCard
+                            .padding(.horizontal)
+                    }
 
                     Button {
                         showAddInvestment = true
@@ -232,6 +295,69 @@ struct ContentView: View {
             }
             .onAppear { scrollProxy = proxy }
         }
+    }
+
+    // MARK: - Search
+
+    private var trimmedSearch: String {
+        searchText.trimmingCharacters(in: .whitespaces)
+    }
+
+    private var isSearching: Bool {
+        !trimmedSearch.isEmpty
+    }
+
+    /// Investments (within the broker/type filter) whose name or symbol contains the search text.
+    private var searchMatches: [Investment] {
+        store.visibleInvestments
+            .filter {
+                $0.name.localizedStandardContains(trimmedSearch)
+                    || ($0.symbol?.localizedStandardContains(trimmedSearch) ?? false)
+            }
+            .sorted { store.valueInGBP(for: $0) > store.valueInGBP(for: $1) }
+    }
+
+    private var searchResults: some View {
+        let matches = searchMatches
+        return VStack(spacing: 0) {
+            if matches.isEmpty {
+                ContentUnavailableView.search(text: trimmedSearch)
+            } else {
+                ForEach(matches) { investment in
+                    if investment.id != matches.first?.id {
+                        Divider()
+                            .padding(.leading, 34)
+                    }
+                    investmentActions(investmentRow(investment, showsSector: true), for: investment)
+                }
+            }
+        }
+        .padding(.vertical, 4)
+        .background(Color(.systemGray6).opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
+        .padding(.horizontal)
+    }
+
+    /// Tap to edit, long-press for Edit/Delete — shared by the sector list and search results.
+    private func investmentActions(_ row: some View, for investment: Investment) -> some View {
+        row
+            .contentShape(Rectangle())
+            .onTapGesture {
+                selectedInvestment = investment
+            }
+            .contextMenu {
+                Button {
+                    selectedInvestment = investment
+                } label: {
+                    Label("Edit", systemImage: "pencil")
+                }
+                if store.canDelete(investment) {
+                    Button(role: .destructive) {
+                        investmentToDelete = investment
+                    } label: {
+                        Label("Delete", systemImage: "trash")
+                    }
+                }
+            }
     }
 
     private func scrollToSector(_ sector: String) {
@@ -249,7 +375,9 @@ struct ContentView: View {
 
     private var portfolioHeader: some View {
         VStack(spacing: 4) {
-            Text("Total Value")
+            Text(store.isFiltering
+                 ? "\([store.brokerFilter, store.accountTypeFilter].compactMap { $0 }.joined(separator: " · ")) Value"
+                 : "Total Value")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             HStack(spacing: 8) {
@@ -260,6 +388,96 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    // MARK: - Target Warning
+
+    /// Shown when targets across all investments don't sum to 100%; tapping opens the Targets page.
+    private var targetWarning: some View {
+        let total = store.totalTargetPercentage
+        let difference = 100 - total
+        return Button {
+            showTargets = true
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Targets add up to \(TargetsView.format(total))")
+                        .font(.subheadline.bold())
+                        .foregroundStyle(.primary)
+                    Text(difference > 0
+                         ? "\(TargetsView.format(difference)) left to assign. Tap to update targets."
+                         : "\(TargetsView.format(-difference)) over 100%. Tap to update targets.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(12)
+            .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("home.targetWarning")
+    }
+
+    // MARK: - Filter Bar
+
+    /// Broker and account type filters. Values, percentages and sectors below only count matching holdings.
+    private var filterBar: some View {
+        HStack(spacing: 8) {
+            filterMenu(
+                title: "Broker",
+                selection: $store.brokerFilter,
+                options: store.filterBrokers,
+                identifier: "filter.broker"
+            )
+            filterMenu(
+                title: "Type",
+                selection: $store.accountTypeFilter,
+                options: store.filterAccountTypes,
+                identifier: "filter.accountType"
+            )
+            Spacer()
+            if store.isFiltering {
+                Button("Clear") {
+                    store.brokerFilter = nil
+                    store.accountTypeFilter = nil
+                }
+                .font(.caption)
+                .accessibilityIdentifier("filter.clear")
+            }
+        }
+    }
+
+    private func filterMenu(title: String, selection: Binding<String?>, options: [String], identifier: String) -> some View {
+        Menu {
+            Picker(title, selection: selection) {
+                Text("All").tag(String?.none)
+                ForEach(options, id: \.self) { option in
+                    Text(option).tag(String?.some(option))
+                }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Text("\(title): \(selection.wrappedValue ?? "All")")
+                    .lineLimit(1)
+                Image(systemName: "chevron.down")
+                    .font(.caption2)
+            }
+            .font(.caption.weight(.medium))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .foregroundStyle(selection.wrappedValue == nil ? Color.primary : Color.white)
+            .background(
+                selection.wrappedValue == nil ? Color(.systemGray5) : Color.accentColor,
+                in: Capsule()
+            )
+        }
+        .accessibilityIdentifier(identifier)
     }
 
     // MARK: - Sector Bar Chart
@@ -389,25 +607,7 @@ struct ContentView: View {
                             ForEach(group.items) { investment in
                                 Divider()
                                     .padding(.leading, 34)
-                                investmentRow(investment)
-                                    .contentShape(Rectangle())
-                                    .onTapGesture {
-                                        selectedInvestment = investment
-                                    }
-                                    .contextMenu {
-                                        Button {
-                                            selectedInvestment = investment
-                                        } label: {
-                                            Label("Edit", systemImage: "pencil")
-                                        }
-                                        if store.canDelete(investment) {
-                                            Button(role: .destructive) {
-                                                investmentToDelete = investment
-                                            } label: {
-                                                Label("Delete", systemImage: "trash")
-                                            }
-                                        }
-                                    }
+                                investmentActions(investmentRow(investment), for: investment)
                             }
                         }
                         .padding(.bottom, 4)
@@ -441,6 +641,9 @@ struct ContentView: View {
             Circle()
                 .fill(statusColor)
                 .frame(width: 10, height: 10)
+
+            let icon = AssetIcons.sector(sector)
+            AssetIconView(symbol: icon.symbol, color: icon.color)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(sector)
@@ -479,7 +682,8 @@ struct ContentView: View {
 
     // MARK: - Investment Row
 
-    private func investmentRow(_ investment: Investment) -> some View {
+    /// - Parameter showsSector: Adds the symbol and sector under the name (search results aren't grouped by sector).
+    private func investmentRow(_ investment: Investment, showsSector: Bool = false) -> some View {
         let gbpValue = store.valueInGBP(for: investment)
         let currentPct = store.currentPercentage(for: investment)
         let statusColor: Color = {
@@ -488,13 +692,23 @@ struct ContentView: View {
             return currentPct >= investment.targetPercentage ? .green : .red
         }()
 
-        return HStack {
+        return HStack(spacing: 10) {
+            // Sits under the sector icon (the row's leading padding matches the sector row's dot + spacing)
+            InvestmentLogoView(symbol: investment.symbol, category: investment.category)
+                .frame(width: 28)
+
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
                     Text(investment.name)
                         .font(.subheadline)
                         .lineLimit(1)
                     priceStatusBadge(for: investment)
+                }
+                if showsSector {
+                    Text([investment.symbol, investment.sectorOrDefault].compactMap { $0 }.joined(separator: " · "))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
                 HStack(spacing: 4) {
                     Text(formatPct(currentPct))
@@ -544,8 +758,8 @@ struct ContentView: View {
     // MARK: - Total Card
 
     private var totalCard: some View {
-        let totalCurPct = store.investments.reduce(0.0) { $0 + store.currentPercentage(for: $1) }
-        let totalTgtPct = store.investments.reduce(0.0) { $0 + $1.targetPercentage }
+        let totalCurPct = store.visibleInvestments.reduce(0.0) { $0 + store.currentPercentage(for: $1) }
+        let totalTgtPct = store.visibleInvestments.reduce(0.0) { $0 + $1.targetPercentage }
 
         return HStack {
             VStack(alignment: .leading, spacing: 2) {
@@ -597,13 +811,30 @@ struct ContentView: View {
 
     /// Handles a file another app shared to this one. iOS gives us a private copy, removed once read.
     private func handleSharedFile(_ url: URL) {
-        guard APIKeyStore.hasClaudeKey else {
+        guard store.hasAPIKey else {
             showMissingKeyAlert = true
             return
         }
         let item = loadFile(url)
         try? FileManager.default.removeItem(at: url)
         enqueueImports([item])
+    }
+
+    /// Imports statements the Share extension left in the App Group inbox.
+    /// Without an API key the files stay in the inbox, so they're imported once a key is added.
+    private func importSharedInbox() {
+        let files = SharedInbox.pendingFiles()
+        guard !files.isEmpty else { return }
+        guard store.hasAPIKey else {
+            showMissingKeyAlert = true
+            return
+        }
+        let items = files.map { file in
+            let item = loadFile(file)
+            SharedInbox.remove(file)
+            return item
+        }
+        enqueueImports(items)
     }
 
     private func loadFile(_ url: URL) -> QueuedImport {
@@ -668,7 +899,7 @@ struct ContentView: View {
         } else if entries.isEmpty {
             presentImportError("\(label): No investments found in the statement.")
         } else {
-            currentPreview = ImportPreview(entries: entries, label: label)
+            currentPreview = ImportPreview(entries: entries, label: label, source: source)
         }
     }
 
@@ -681,7 +912,7 @@ struct ContentView: View {
 
     /// Runs the action only if a Claude API key is saved; otherwise prompts the user to add one.
     private func requireAPIKey(_ action: () -> Void) {
-        if APIKeyStore.hasClaudeKey {
+        if store.hasAPIKey {
             action()
         } else {
             showMissingKeyAlert = true
@@ -766,5 +997,5 @@ struct ReclassifySheet: View {
 }
 
 #Preview {
-    ContentView()
+    ContentView(store: PortfolioStore())
 }

@@ -6,12 +6,71 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		5A7B0F933084192D00C37C12 /* ShareToInvestment.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 5A7B0F893084192D00C37C12 /* ShareToInvestment.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		5A7B0F913084192D00C37C12 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 5A9DB59D305363B7004CCDC5 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 5A7B0F883084192D00C37C12;
+			remoteInfo = ShareToInvestment;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		5A7B0F943084192D00C37C12 /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				5A7B0F933084192D00C37C12 /* ShareToInvestment.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
+		5A0C037A3083C09D0084CC18 /* Investment AppTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "Investment AppTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
+		5A0C03853083C09F0084CC18 /* Investment AppUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "Investment AppUITests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 		5A188A4A307AAB6F00629C6B /* Investment-App-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = "Investment-App-Info.plist"; sourceTree = "<group>"; };
+		5A7B0F893084192D00C37C12 /* ShareToInvestment.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = ShareToInvestment.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		5A9DB5A5305363B7004CCDC5 /* Investment App.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Investment App.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		5A7B0F973084192D00C37C12 /* Exceptions for "ShareToInvestment" folder in "ShareToInvestment" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = 5A7B0F883084192D00C37C12 /* ShareToInvestment */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
+		5A0C037B3083C09D0084CC18 /* Investment AppTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = "Investment AppTests";
+			sourceTree = "<group>";
+		};
+		5A0C03863083C09F0084CC18 /* Investment AppUITests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = "Investment AppUITests";
+			sourceTree = "<group>";
+		};
+		5A7B0F8A3084192D00C37C12 /* ShareToInvestment */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				5A7B0F973084192D00C37C12 /* Exceptions for "ShareToInvestment" folder in "ShareToInvestment" target */,
+			);
+			path = ShareToInvestment;
+			sourceTree = "<group>";
+		};
 		5A9DB5A7305363B7004CCDC5 /* Investment App */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = "Investment App";
@@ -20,6 +79,27 @@
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
+		5A0C03773083C09D0084CC18 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		5A0C03823083C09F0084CC18 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		5A7B0F863084192D00C37C12 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		5A9DB5A2305363B7004CCDC5 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -35,6 +115,9 @@
 			children = (
 				5A188A4A307AAB6F00629C6B /* Investment-App-Info.plist */,
 				5A9DB5A7305363B7004CCDC5 /* Investment App */,
+				5A0C037B3083C09D0084CC18 /* Investment AppTests */,
+				5A0C03863083C09F0084CC18 /* Investment AppUITests */,
+				5A7B0F8A3084192D00C37C12 /* ShareToInvestment */,
 				5A9DB5A6305363B7004CCDC5 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -43,6 +126,9 @@
 			isa = PBXGroup;
 			children = (
 				5A9DB5A5305363B7004CCDC5 /* Investment App.app */,
+				5A0C037A3083C09D0084CC18 /* Investment AppTests.xctest */,
+				5A0C03853083C09F0084CC18 /* Investment AppUITests.xctest */,
+				5A7B0F893084192D00C37C12 /* ShareToInvestment.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -50,6 +136,72 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		5A0C03793083C09D0084CC18 /* Investment AppTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 5A0C037E3083C09D0084CC18 /* Build configuration list for PBXNativeTarget "Investment AppTests" */;
+			buildPhases = (
+				5A0C03763083C09D0084CC18 /* Sources */,
+				5A0C03773083C09D0084CC18 /* Frameworks */,
+				5A0C03783083C09D0084CC18 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				5A0C037B3083C09D0084CC18 /* Investment AppTests */,
+			);
+			name = "Investment AppTests";
+			packageProductDependencies = (
+			);
+			productName = "Investment AppTests";
+			productReference = 5A0C037A3083C09D0084CC18 /* Investment AppTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		5A0C03843083C09F0084CC18 /* Investment AppUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 5A0C03893083C09F0084CC18 /* Build configuration list for PBXNativeTarget "Investment AppUITests" */;
+			buildPhases = (
+				5A0C03813083C09F0084CC18 /* Sources */,
+				5A0C03823083C09F0084CC18 /* Frameworks */,
+				5A0C03833083C09F0084CC18 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				5A0C03863083C09F0084CC18 /* Investment AppUITests */,
+			);
+			name = "Investment AppUITests";
+			packageProductDependencies = (
+			);
+			productName = "Investment AppUITests";
+			productReference = 5A0C03853083C09F0084CC18 /* Investment AppUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+		5A7B0F883084192D00C37C12 /* ShareToInvestment */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 5A7B0F983084192D00C37C12 /* Build configuration list for PBXNativeTarget "ShareToInvestment" */;
+			buildPhases = (
+				5A7B0F853084192D00C37C12 /* Sources */,
+				5A7B0F863084192D00C37C12 /* Frameworks */,
+				5A7B0F873084192D00C37C12 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				5A7B0F8A3084192D00C37C12 /* ShareToInvestment */,
+			);
+			name = ShareToInvestment;
+			packageProductDependencies = (
+			);
+			productName = ShareToInvestment;
+			productReference = 5A7B0F893084192D00C37C12 /* ShareToInvestment.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 		5A9DB5A4305363B7004CCDC5 /* Investment App */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 5A9DB5B0305363B8004CCDC5 /* Build configuration list for PBXNativeTarget "Investment App" */;
@@ -57,10 +209,12 @@
 				5A9DB5A1305363B7004CCDC5 /* Sources */,
 				5A9DB5A2305363B7004CCDC5 /* Frameworks */,
 				5A9DB5A3305363B7004CCDC5 /* Resources */,
+				5A7B0F943084192D00C37C12 /* Embed Foundation Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				5A7B0F923084192D00C37C12 /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				5A9DB5A7305363B7004CCDC5 /* Investment App */,
@@ -79,9 +233,18 @@
 			isa = PBXProject;
 			attributes = {
 				BuildIndependentTargetsInParallel = 1;
-				LastSwiftUpdateCheck = 2630;
+				LastSwiftUpdateCheck = 2700;
 				LastUpgradeCheck = 2630;
 				TargetAttributes = {
+					5A0C03793083C09D0084CC18 = {
+						CreatedOnToolsVersion = 27.0;
+					};
+					5A0C03843083C09F0084CC18 = {
+						CreatedOnToolsVersion = 27.0;
+					};
+					5A7B0F883084192D00C37C12 = {
+						CreatedOnToolsVersion = 27.0;
+					};
 					5A9DB5A4305363B7004CCDC5 = {
 						CreatedOnToolsVersion = 26.3;
 					};
@@ -102,11 +265,35 @@
 			projectRoot = "";
 			targets = (
 				5A9DB5A4305363B7004CCDC5 /* Investment App */,
+				5A0C03793083C09D0084CC18 /* Investment AppTests */,
+				5A0C03843083C09F0084CC18 /* Investment AppUITests */,
+				5A7B0F883084192D00C37C12 /* ShareToInvestment */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
+		5A0C03783083C09D0084CC18 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		5A0C03833083C09F0084CC18 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		5A7B0F873084192D00C37C12 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		5A9DB5A3305363B7004CCDC5 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -117,6 +304,27 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		5A0C03763083C09D0084CC18 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		5A0C03813083C09F0084CC18 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		5A7B0F853084192D00C37C12 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		5A9DB5A1305363B7004CCDC5 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -126,7 +334,173 @@
 		};
 /* End PBXSourcesBuildPhase section */
 
+/* Begin PBXTargetDependency section */
+		5A7B0F923084192D00C37C12 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 5A7B0F883084192D00C37C12 /* ShareToInvestment */;
+			targetProxy = 5A7B0F913084192D00C37C12 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
 /* Begin XCBuildConfiguration section */
+		5A0C037F3083C09D0084CC18 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
+				MACOSX_DEPLOYMENT_TARGET = 27.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "Rashidy.Investment-AppTests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = auto;
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2,7";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Investment App.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Investment App";
+				XROS_DEPLOYMENT_TARGET = 27.0;
+			};
+			name = Debug;
+		};
+		5A0C03803083C09D0084CC18 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
+				MACOSX_DEPLOYMENT_TARGET = 27.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "Rashidy.Investment-AppTests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = auto;
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2,7";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Investment App.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Investment App";
+				XROS_DEPLOYMENT_TARGET = 27.0;
+			};
+			name = Release;
+		};
+		5A0C038A3083C09F0084CC18 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
+				MACOSX_DEPLOYMENT_TARGET = 27.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "Rashidy.Investment-AppUITests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = auto;
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2,7";
+				XROS_DEPLOYMENT_TARGET = 27.0;
+			};
+			name = Debug;
+		};
+		5A0C038B3083C09F0084CC18 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
+				MACOSX_DEPLOYMENT_TARGET = 27.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "Rashidy.Investment-AppUITests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = auto;
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2,7";
+				XROS_DEPLOYMENT_TARGET = 27.0;
+			};
+			name = Release;
+		};
+		5A7B0F953084192D00C37C12 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = ShareToInvestment/ShareToInvestment.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 2GEVNAZZKJ;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = ShareToInvestment/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = ShareToInvestment;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "Rashidy.Investment-App.ShareToInvestment";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				REGISTER_APP_GROUPS = YES;
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		5A7B0F963084192D00C37C12 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = ShareToInvestment/ShareToInvestment.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 2GEVNAZZKJ;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = ShareToInvestment/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = ShareToInvestment;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "Rashidy.Investment-App.ShareToInvestment";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				REGISTER_APP_GROUPS = YES;
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
 		5A9DB5AE305363B8004CCDC5 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -253,6 +627,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = "Investment App/Investment App.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 2GEVNAZZKJ;
@@ -272,6 +647,7 @@
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = "Rashidy.Investment-App";
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				REGISTER_APP_GROUPS = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
@@ -287,6 +663,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = "Investment App/Investment App.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 2GEVNAZZKJ;
@@ -306,6 +683,7 @@
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = "Rashidy.Investment-App";
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				REGISTER_APP_GROUPS = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
@@ -319,6 +697,33 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		5A0C037E3083C09D0084CC18 /* Build configuration list for PBXNativeTarget "Investment AppTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				5A0C037F3083C09D0084CC18 /* Debug */,
+				5A0C03803083C09D0084CC18 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		5A0C03893083C09F0084CC18 /* Build configuration list for PBXNativeTarget "Investment AppUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				5A0C038A3083C09F0084CC18 /* Debug */,
+				5A0C038B3083C09F0084CC18 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		5A7B0F983084192D00C37C12 /* Build configuration list for PBXNativeTarget "ShareToInvestment" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				5A7B0F953084192D00C37C12 /* Debug */,
+				5A7B0F963084192D00C37C12 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 		5A9DB5A0305363B7004CCDC5 /* Build configuration list for PBXProject "Investment App" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
