@@ -14,6 +14,29 @@ struct StatementSource {
     /// File name shown in the import preview and in error messages.
     let name: String
     let contentBlock: [String: Any]
+    /// The original file contents and type, kept so the statement can be viewed in the import preview.
+    var originalData: Data? = nil
+    var contentType: UTType? = nil
+
+    /// Whether the original file is available to view.
+    var canPreview: Bool { originalData != nil }
+
+    /// Writes the original file to a temporary location for Quick Look, with an extension so its type is recognised.
+    func writePreviewFile() throws -> URL {
+        guard let originalData else { throw StatementFileError.unreadable(name: name) }
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StatementPreviews", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        var fileName = name
+        if URL(fileURLWithPath: name).pathExtension.isEmpty, let ext = contentType?.preferredFilenameExtension {
+            fileName += ".\(ext)"
+        }
+        let url = directory.appendingPathComponent(fileName)
+        try originalData.write(to: url, options: .atomic)
+        return url
+    }
 }
 
 enum StatementFileError: LocalizedError {
@@ -57,42 +80,50 @@ enum StatementFileLoader {
     /// Loads raw data of a known type (e.g. a photo from the Photos picker).
     static func load(data: Data, type: UTType?, name: String) throws -> StatementSource {
         guard let type else { throw StatementFileError.unsupported(name: name) }
+        return StatementSource(
+            name: name,
+            contentBlock: try contentBlock(data: data, type: type, name: name),
+            originalData: data,
+            contentType: type
+        )
+    }
 
+    private static func contentBlock(data: Data, type: UTType, name: String) throws -> [String: Any] {
         if type.conforms(to: .pdf) {
-            return StatementSource(name: name, contentBlock: [
+            return [
                 "type": "document",
                 "source": ["type": "base64", "media_type": "application/pdf", "data": data.base64EncodedString()]
-            ])
+            ]
         }
 
         if type.conforms(to: .image) {
-            return try imageSource(data: data, type: type, name: name)
+            return try imageBlock(data: data, type: type, name: name)
         }
 
         // CSV, TSV, plain text, JSON, HTML, … all conform to public.text
         if type.conforms(to: .text) {
             let text = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
-            return StatementSource(name: name, contentBlock: [
+            return [
                 "type": "text",
                 "text": "Contents of the statement file \"\(name)\":\n\n\(text)"
-            ])
+            ]
         }
 
         throw StatementFileError.unsupported(name: name)
     }
 
     /// Sends supported images as-is when small enough; otherwise downscales and re-encodes as JPEG.
-    private static func imageSource(data: Data, type: UTType, name: String) throws -> StatementSource {
+    private static func imageBlock(data: Data, type: UTType, name: String) throws -> [String: Any] {
         guard let image = UIImage(data: data) else { throw StatementFileError.unreadable(name: name) }
 
         let longestEdge = max(image.size.width, image.size.height) * image.scale
         if let direct = directImageTypes.first(where: { type.conforms(to: $0.type) }),
            data.count <= maxImageBytes, longestEdge <= maxImageDimension {
-            return imageBlock(name: name, data: data, mimeType: direct.mimeType)
+            return imageBlock(data: data, mimeType: direct.mimeType)
         }
 
         guard let jpeg = downscaledJPEG(image) else { throw StatementFileError.unreadable(name: name) }
-        return imageBlock(name: name, data: jpeg, mimeType: "image/jpeg")
+        return imageBlock(data: jpeg, mimeType: "image/jpeg")
     }
 
     private static func downscaledJPEG(_ image: UIImage) -> Data? {
@@ -116,10 +147,10 @@ enum StatementFileLoader {
         return nil
     }
 
-    private static func imageBlock(name: String, data: Data, mimeType: String) -> StatementSource {
-        StatementSource(name: name, contentBlock: [
+    private static func imageBlock(data: Data, mimeType: String) -> [String: Any] {
+        [
             "type": "image",
             "source": ["type": "base64", "media_type": mimeType, "data": data.base64EncodedString()]
-        ])
+        ]
     }
 }

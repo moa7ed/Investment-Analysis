@@ -41,9 +41,9 @@ struct EditInvestmentView: View {
         _investment = State(initialValue: investment)
         _nameText = State(initialValue: investment.name)
         _symbolText = State(initialValue: investment.symbol ?? "")
-        _manualPriceText = State(initialValue: investment.manualPrice.map(NumberText.format) ?? "")
+        _manualPriceText = State(initialValue: investment.manualPrice.map { NumberText.format($0) } ?? "")
         _currencyCode = State(initialValue: investment.currencyCode)
-        _manualValueText = State(initialValue: investment.manualValue.map(NumberText.format) ?? "")
+        _manualValueText = State(initialValue: investment.manualValue.map { NumberText.format($0) } ?? "")
         _targetPctText = State(initialValue: NumberText.format(investment.targetPercentage))
         _sectorText = State(initialValue: investment.sectorOrDefault)
         _holdingDrafts = State(initialValue: investment.holdings.map {
@@ -114,8 +114,14 @@ struct EditInvestmentView: View {
                     // Add new holding
                     HStack {
                         TextField("Broker", text: $newBroker)
-                        TextField("Type", text: $newAccountType)
-                            .frame(width: 70)
+                        Picker("Type", selection: $newAccountType) {
+                            ForEach(Holding.standardAccountTypes, id: \.self) { type in
+                                Text(type).tag(type)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        .fixedSize()
                         Button {
                             let broker = newBroker.trimmingCharacters(in: .whitespaces)
                             guard !broker.isEmpty else { return }
@@ -232,7 +238,7 @@ struct EditInvestmentView: View {
     /// True if any numeric field contains text that isn't a valid number — Save is blocked so nothing is silently dropped.
     private var hasInvalidNumber: Bool {
         ([manualPriceText, manualValueText, targetPctText] + holdingDrafts.map(\.sharesText))
-            .contains(where: NumberText.isInvalid)
+            .contains(where: { NumberText.isInvalid($0) })
     }
 
     @ViewBuilder
@@ -247,41 +253,44 @@ struct EditInvestmentView: View {
 
 /// Parses and formats numbers using the device's region settings (decimal separator, grouping, digits).
 /// Parsing is strict: text that isn't entirely a valid non-negative number returns nil rather than a partial value.
+/// `locale` defaults to the device's region; tests pass a fixed one.
 enum NumberText {
-    private static let parser: NumberFormatter = {
+    private static func parser(_ locale: Locale) -> NumberFormatter {
         let formatter = NumberFormatter()
+        formatter.locale = locale
         formatter.numberStyle = .decimal
         formatter.isLenient = false
         formatter.minimum = 0
         return formatter
-    }()
+    }
 
-    private static let formatter: NumberFormatter = {
+    private static func formatter(_ locale: Locale) -> NumberFormatter {
         let formatter = NumberFormatter()
+        formatter.locale = locale
         formatter.numberStyle = .decimal
         formatter.usesGroupingSeparator = false
         formatter.maximumFractionDigits = 10
         return formatter
-    }()
+    }
 
     static func isEmpty(_ text: String) -> Bool {
         text.trimmingCharacters(in: .whitespaces).isEmpty
     }
 
     /// The parsed value, or nil if the text is empty or invalid.
-    static func parse(_ text: String) -> Double? {
+    static func parse(_ text: String, locale: Locale = .current) -> Double? {
         let trimmed = text.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return nil }
-        return parser.number(from: trimmed)?.doubleValue
+        return parser(locale).number(from: trimmed)?.doubleValue
     }
 
     /// Non-empty text that can't be parsed.
-    static func isInvalid(_ text: String) -> Bool {
-        !isEmpty(text) && parse(text) == nil
+    static func isInvalid(_ text: String, locale: Locale = .current) -> Bool {
+        !isEmpty(text) && parse(text, locale: locale) == nil
     }
 
     /// Formats without trailing ".0" or grouping, e.g. 5 → "5", 12.5 → "12.5" (or "12,5" in comma regions).
-    static func format(_ value: Double) -> String {
-        formatter.string(from: NSNumber(value: value)) ?? "\(value)"
+    static func format(_ value: Double, locale: Locale = .current) -> String {
+        formatter(locale).string(from: NSNumber(value: value)) ?? "\(value)"
     }
 }

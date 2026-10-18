@@ -6,196 +6,120 @@
 //
 
 import SwiftUI
+import QuickLook
 
-private struct EntryChanges {
-    let changes: [String]
-    static let empty = EntryChanges(changes: [])
-}
-
-/// Whether a holding will have a live price after import.
-private enum PriceCheck {
-    case notNeeded, checking, ok, missing
-}
-
-/// How the user chose to price a holding Yahoo couldn't price.
-private struct PriceResolution {
-    enum Mode: Hashable {
-        case manualPrice, fromValue, ticker
-    }
-    var mode: Mode?
-    var priceText = ""
-    var tickerText = ""
-    /// The ticker text that last passed the Yahoo check
-    var verifiedTicker: String?
-    var isCheckingTicker = false
-    var tickerFailed = false
-
-    var trimmedTicker: String {
-        tickerText.trimmingCharacters(in: .whitespaces).uppercased()
-    }
-}
-
+/// Preview of a parsed statement before it's applied. All state and logic live in `ImportPreviewModel`.
 struct StatementImportPreviewSheet: View {
-    /// Editable so the user can override each entry's match before applying.
-    @State private var entries: [ParsedStatementEntry]
-    let store: PortfolioStore
+    @State private var model: ImportPreviewModel
     @Environment(\.dismiss) private var dismiss
 
-    /// The broker every entry is recorded under. Holdings are keyed by broker, so the user confirms it before applying.
-    @State private var brokerText: String
-    /// Whether Claude found a broker name in the statement (affects the hint shown).
-    private let brokerWasDetected: Bool
+    /// The original statement file, viewable from the preview so entries can be checked against it.
+    private let source: StatementSource?
+    /// Temporary copy of the statement shown in Quick Look; removed when Quick Look closes.
+    @State private var statementFileURL: URL?
+    @State private var statementOpenError: String?
 
-    /// The file this statement came from, e.g. "statement.pdf (2 of 5)".
-    private let sourceLabel: String?
-
-    init(entries: [ParsedStatementEntry], store: PortfolioStore, sourceLabel: String? = nil) {
-        self.sourceLabel = sourceLabel
-        _entries = State(initialValue: entries)
-        let detected = entries.compactMap(\.broker).first { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
-        _brokerText = State(initialValue: detected ?? "")
-        brokerWasDetected = detected != nil
-        self.store = store
-    }
-
-    private var trimmedBroker: String {
-        brokerText.trimmingCharacters(in: .whitespaces)
-    }
-
-    /// nil = use the account type Claude detected per entry (handles statements with both ISA and Invest sections).
-    @State private var accountTypeOverride: String?
-
-    /// Yahoo live-price results by symbol (true = a price was found).
-    @State private var livePriceBySymbol: [String: Bool] = [:]
-    /// The user's chosen fix for each entry that has no live price, keyed by entry ID.
-    @State private var priceResolutions: [UUID: PriceResolution] = [:]
-
-    /// Account types offered in the picker: the common ones plus any already used in the portfolio.
-    private var accountTypeOptions: [String] {
-        var seen = Set<String>()
-        return (["ISA", "Invest"] + store.investments.flatMap(\.holdings).map(\.accountType))
-            .filter { $0 != "General" && seen.insert($0.lowercased()).inserted }
-    }
-
-    /// Entries with the confirmed broker (and account type, if forced) applied — used for the preview and for Apply.
-    private var effectiveEntries: [ParsedStatementEntry] {
-        entries.map { entry in
-            var entry = entry
-            entry.broker = trimmedBroker
-            if let accountTypeOverride {
-                entry.accountType = accountTypeOverride
-            }
-            return entry
-        }
-    }
-
-    /// Brokers already used in the portfolio, offered as quick picks.
-    private var knownBrokers: [String] {
-        var seen = Set<String>()
-        return store.investments
-            .flatMap(\.holdings)
-            .map(\.broker)
-            .filter { $0 != "Unknown" && seen.insert(PortfolioStore.normalizeBroker($0)).inserted }
-            .sorted()
-    }
-
-    /// Existing investments a regular entry can be matched to (Cash is matched automatically).
-    private var matchCandidates: [Investment] {
-        store.investments.filter { $0.category.lowercased() != "cash" }
-    }
-
-    /// Entries for display: cash is aggregated per (broker, account type) exactly as Apply does; regular entries pass through.
-    private var displayEntries: [ParsedStatementEntry] {
-        let cashEntries = effectiveEntries.filter(\.isCash)
-        let regularEntries = effectiveEntries.filter { !$0.isCash }
-
-        let consolidatedCash = PortfolioStore.consolidatedCash(cashEntries, exchangeRates: store.exchangeRates).map { cash in
-            ParsedStatementEntry(
-                name: "Cash",
-                symbol: nil,
-                shares: cash.gbpTotal,
-                value: cash.gbpTotal,
-                price: 1,
-                currencyCode: "GBP",
-                category: "Cash",
-                accountType: cash.accountType,
-                broker: cash.broker
-            )
-        }
-
-        return regularEntries + consolidatedCash
+    init(entries: [ParsedStatementEntry], store: PortfolioStore, sourceLabel: String? = nil, source: StatementSource? = nil) {
+        _model = State(initialValue: ImportPreviewModel(entries: entries, store: store, sourceLabel: sourceLabel))
+        self.source = source
     }
 
     var body: some View {
+        @Bindable var model = model
         NavigationStack {
             List {
                 Section {
-                    TextField("Broker name", text: $brokerText)
+                    TextField("Broker name", text: $model.brokerText)
                         .autocorrectionDisabled()
-                    if !knownBrokers.isEmpty {
+                        .accessibilityIdentifier("import.broker")
+                    if !model.knownBrokers.isEmpty {
                         Menu("Choose an existing broker") {
-                            ForEach(knownBrokers, id: \.self) { broker in
-                                Button(broker) { brokerText = broker }
+                            ForEach(model.knownBrokers, id: \.self) { broker in
+                                Button(broker) { model.brokerText = broker }
                             }
                         }
                     }
                 } header: {
                     Text("Broker")
                 } footer: {
-                    if trimmedBroker.isEmpty {
+                    if model.trimmedBroker.isEmpty {
                         Text("No broker name was found in the statement. Enter one to continue — it decides which holdings are updated.")
                             .foregroundStyle(.red)
-                    } else if brokerWasDetected {
+                    } else if model.brokerWasDetected {
                         Text("Detected from the statement. Check it's correct — it decides which holdings are updated.")
                     }
                 }
 
                 Section {
-                    Picker("Account Type", selection: $accountTypeOverride) {
+                    Picker("Account Type", selection: $model.accountTypeOverride) {
                         Text("As detected").tag(String?.none)
-                        ForEach(accountTypeOptions, id: \.self) { type in
+                        ForEach(model.accountTypeOptions, id: \.self) { type in
                             Text(type).tag(String?.some(type))
                         }
                     }
+                    .accessibilityIdentifier("import.accountType")
                 } footer: {
-                    Text(accountTypeOverride == nil
+                    Text(model.accountTypeOverride == nil
                          ? "Uses the account type found for each entry. Choose one to apply it to the whole statement."
-                         : "Every entry, including cash, is recorded under \(accountTypeOverride ?? "").")
+                         : "Every entry, including cash, is recorded under \(model.accountTypeOverride ?? "").")
                 }
 
                 Section {
-                    if let sourceLabel {
+                    if let sourceLabel = model.sourceLabel {
                         LabeledContent("Statement", value: sourceLabel)
                     }
-                    LabeledContent("Investments Found", value: "\(displayEntries.count)")
+                    if let source, source.canPreview {
+                        Button {
+                            openStatement(source)
+                        } label: {
+                            Label("View Statement", systemImage: "doc.text.magnifyingglass")
+                        }
+                        .accessibilityIdentifier("import.viewStatement")
+                    }
+                    LabeledContent("Investments Found", value: "\(model.displayEntries.count)")
                     LabeledContent("Matched to Existing") {
-                        Text("\(matchedCount)")
+                        Text("\(model.matchedCount)")
                             .foregroundStyle(.green)
                     }
-                    if updateCount > 0 {
+                    if model.updateCount > 0 {
                         LabeledContent("Will Be Updated") {
-                            Text("\(updateCount)")
+                            Text("\(model.updateCount)")
                                 .foregroundStyle(.orange)
                         }
                     }
                     LabeledContent("New Investments") {
-                        Text("\(newCount)")
+                        Text("\(model.newCount)")
                             .foregroundStyle(.blue)
                     }
-                    if !accountTypes.isEmpty {
-                        LabeledContent("Account Types", value: accountTypes.joined(separator: ", "))
+                    if !model.accountTypes.isEmpty {
+                        LabeledContent("Account Types", value: model.accountTypes.joined(separator: ", "))
                     }
                 }
 
                 Section("Investments") {
-                    ForEach(displayEntries) { entry in
+                    ForEach(model.displayEntries) { entry in
                         entryRow(entry)
                     }
                 }
             }
             // Re-runs whenever new symbols need checking (e.g. after changing a match)
-            .task(id: symbolsToCheck) {
-                await checkLivePrices(symbolsToCheck)
+            .task(id: model.pendingCheckKey) {
+                await model.runSymbolChecks()
+            }
+            .quickLookPreview($statementFileURL)
+            .onChange(of: statementFileURL) { oldURL, newURL in
+                // Quick Look closed — remove the temporary copy
+                if newURL == nil, let oldURL {
+                    try? FileManager.default.removeItem(at: oldURL.deletingLastPathComponent())
+                }
+            }
+            .alert("Couldn't Open Statement", isPresented: Binding(
+                get: { statementOpenError != nil },
+                set: { if !$0 { statementOpenError = nil } }
+            )) {
+                Button("OK") {}
+            } message: {
+                Text(statementOpenError ?? "")
             }
             .navigationTitle("Import Preview")
             .navigationBarTitleDisplayMode(.inline)
@@ -205,14 +129,13 @@ struct StatementImportPreviewSheet: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Apply") {
-                        let toApply = entriesForApply()
-                        Task {
-                            store.applyStatementEntries(toApply)
-                            await store.fetchAllPrices()
-                        }
+                        model.apply()
+                        let store = model.store
+                        Task { await store.fetchAllPrices() }
                         dismiss()
                     }
-                    .disabled(trimmedBroker.isEmpty || hasUnresolvedPrices)
+                    .disabled(!model.canApply)
+                    .accessibilityIdentifier("import.apply")
                 }
             }
         }
@@ -222,8 +145,8 @@ struct StatementImportPreviewSheet: View {
 
     @ViewBuilder
     private func entryRow(_ entry: ParsedStatementEntry) -> some View {
-        let matched = matchedInvestment(for: entry)
-        let changes = matched.map { computeChanges(entry: entry, existing: $0) } ?? .empty
+        let matched = model.matchedInvestment(for: entry)
+        let changes = matched.map { model.computeChanges(entry: entry, existing: $0) } ?? .empty
         VStack(alignment: .leading, spacing: 4) {
             // Name + badges
             HStack(spacing: 6) {
@@ -260,13 +183,14 @@ struct StatementImportPreviewSheet: View {
             if !entry.isCash {
                 Picker("Match to", selection: matchSelection(for: entry.id)) {
                     Text("New investment").tag(UUID?.none)
-                    ForEach(matchCandidates) { investment in
+                    ForEach(model.matchCandidates) { investment in
                         Text("\(investment.name) (\(investment.symbol ?? "no symbol"))")
                             .tag(UUID?.some(investment.id))
                     }
                 }
                 .pickerStyle(.menu)
                 .font(.caption)
+                .accessibilityIdentifier("import.match.\(entry.name)")
             }
 
             // Symbol, shares, value
@@ -296,16 +220,16 @@ struct StatementImportPreviewSheet: View {
             if matched != nil, !changes.changes.isEmpty {
                 VStack(alignment: .leading, spacing: 2) {
                     ForEach(changes.changes, id: \.self) { change in
-                            Text(change)
-                                .font(.caption2)
-                                .foregroundStyle(.orange)
-                        }
+                        Text(change)
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
                     }
-                    .padding(.top, 2)
+                }
+                .padding(.top, 2)
             }
 
             // Holdings Yahoo can't price must be resolved before Apply
-            switch priceCheck(for: entry) {
+            switch model.priceCheck(for: entry) {
             case .checking:
                 HStack(spacing: 6) {
                     ProgressView().controlSize(.mini)
@@ -313,8 +237,30 @@ struct StatementImportPreviewSheet: View {
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
-            case .missing:
-                priceResolutionView(for: entry)
+            case .findingSymbol:
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.mini)
+                    Text("No live price for \(model.pricingSymbol(for: entry) ?? entry.name) — finding the correct symbol…")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            case .corrected(let symbol, let name):
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Label(
+                        "Symbol corrected: \(model.pricingSymbol(for: entry) ?? "none") → \(symbol)\(name.map { " (\($0))" } ?? "")",
+                        systemImage: "checkmark.circle.fill"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.green)
+                    Spacer()
+                    Button("Undo") {
+                        model.undoCorrection(forEntry: entry.id)
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                }
+            case .missing(let reason):
+                priceResolutionView(for: entry, reason: reason)
             case .ok, .notNeeded:
                 EmptyView()
             }
@@ -322,226 +268,67 @@ struct StatementImportPreviewSheet: View {
         .padding(.vertical, 2)
     }
 
-    // MARK: - Helpers
+    // MARK: - Statement
+
+    private func openStatement(_ source: StatementSource) {
+        do {
+            statementFileURL = try source.writePreviewFile()
+        } catch {
+            statementOpenError = error.localizedDescription
+        }
+    }
+
+    // MARK: - Bindings
 
     /// Binding for an entry's match picker: nil means "New investment".
     private func matchSelection(for entryID: UUID) -> Binding<UUID?> {
         Binding(
-            get: {
-                entries.first(where: { $0.id == entryID }).flatMap { matchedInvestment(for: $0)?.id }
-            },
-            set: { newValue in
-                guard let i = entries.firstIndex(where: { $0.id == entryID }) else { return }
-                entries[i].matchedInvestmentID = newValue
-                entries[i].isForcedNew = newValue == nil
-            }
+            get: { model.matchedInvestmentID(forEntry: entryID) },
+            set: { model.setMatch(forEntry: entryID, to: $0) }
         )
-    }
-
-    private var matchedCount: Int {
-        displayEntries.filter { matchedInvestment(for: $0) != nil }.count
-    }
-
-    private var updateCount: Int {
-        displayEntries.filter { entry in
-            guard let existing = matchedInvestment(for: entry) else { return false }
-            return !computeChanges(entry: entry, existing: existing).changes.isEmpty
-        }.count
-    }
-
-    private var newCount: Int {
-        displayEntries.filter { matchedInvestment(for: $0) == nil }.count
-    }
-
-    private var accountTypes: [String] {
-        Array(Set(effectiveEntries.map(\.resolvedAccountType))).sorted()
-    }
-
-    /// Computes changes between an entry and an existing investment.
-    private func computeChanges(entry: ParsedStatementEntry, existing: Investment) -> EntryChanges {
-        var changes: [String] = []
-        let brokerName = entry.resolvedBroker
-        let brokerNorm = PortfolioStore.normalizeBroker(brokerName)
-        let acctType = entry.resolvedAccountType
-        let typeLower = acctType.lowercased()
-
-        // Cash entries are already aggregated per (broker, account type) in displayEntries — compare the GBP total
-        if entry.isCash {
-            let gbpTotal = entry.value ?? entry.shares
-            if let existingHolding = existing.holdings.first(where: {
-                PortfolioStore.normalizeBroker($0.broker) == brokerNorm && $0.accountType.lowercased() == typeLower
-            }) {
-                if existingHolding.shares != gbpTotal {
-                    changes.append("Cash (\(brokerName) \(acctType)): \(existingHolding.shares.formatted(.currency(code: "GBP").precision(.fractionLength(0)))) → \(gbpTotal.formatted(.currency(code: "GBP").precision(.fractionLength(0))))")
-                }
-            } else {
-                changes.append("Add cash: \(brokerName) · \(acctType) — \(gbpTotal.formatted(.currency(code: "GBP").precision(.fractionLength(0))))")
-            }
-            return EntryChanges(changes: changes)
-        }
-
-        if let existingHolding = existing.holdings.first(where: {
-            PortfolioStore.normalizeBroker($0.broker) == brokerNorm && $0.accountType.lowercased() == typeLower
-        }) {
-            if existingHolding.shares != entry.shares {
-                changes.append("Shares (\(brokerName) \(acctType)): \(existingHolding.shares.formatted()) → \(entry.shares.formatted())")
-            }
-        } else {
-            changes.append("Add holding: \(brokerName) · \(acctType) — \(entry.shares.formatted()) shares")
-        }
-
-        return EntryChanges(changes: changes)
-    }
-
-    /// Finds the existing investment that matches this entry, or nil if new.
-    private func matchedInvestment(for entry: ParsedStatementEntry) -> Investment? {
-        store.matchingInvestment(for: entry)
-    }
-
-    // MARK: - Live Price Check
-
-    /// The symbol this entry will be priced with after import, or nil if it won't have one.
-    private func pricingSymbol(for entry: ParsedStatementEntry) -> String? {
-        // A matched investment keeps its own symbol; a new one uses the statement's
-        if let matched = matchedInvestment(for: entry) {
-            return matched.symbol
-        }
-        return entry.symbol
-    }
-
-    private func priceCheck(for entry: ParsedStatementEntry) -> PriceCheck {
-        guard !entry.isCash else { return .notNeeded }
-        if let matched = matchedInvestment(for: entry) {
-            switch store.priceStatus(for: matched) {
-            case .manual: return .notNeeded // already priced manually
-            case .live: return .ok
-            case .noLivePrice: break
-            }
-        }
-        guard let symbol = pricingSymbol(for: entry) else { return .missing }
-        switch livePriceBySymbol[symbol] {
-        case nil: return .checking
-        case true?: return .ok
-        case false?: return .missing
-        }
-    }
-
-    /// Symbols still waiting for a Yahoo check — drives the `.task` that checks them.
-    private var symbolsToCheck: [String] {
-        Array(Set(displayEntries.filter { priceCheck(for: $0) == .checking }.compactMap(pricingSymbol))).sorted()
-    }
-
-    private func checkLivePrices(_ symbols: [String]) async {
-        await withTaskGroup(of: (String, Bool).self) { group in
-            for symbol in symbols {
-                group.addTask { (symbol, await store.hasLivePrice(symbol: symbol)) }
-            }
-            for await (symbol, hasPrice) in group {
-                livePriceBySymbol[symbol] = hasPrice
-            }
-        }
-    }
-
-    /// Price per unit from the statement's value, if it has one.
-    private func valuePerUnit(for entry: ParsedStatementEntry) -> Double? {
-        guard let value = entry.value, entry.shares > 0 else { return nil }
-        return value / entry.shares
-    }
-
-    private func isResolved(_ entry: ParsedStatementEntry) -> Bool {
-        guard let resolution = priceResolutions[entry.id], let mode = resolution.mode else { return false }
-        switch mode {
-        case .manualPrice: return (NumberText.parse(resolution.priceText) ?? 0) > 0
-        case .fromValue: return valuePerUnit(for: entry) != nil
-        case .ticker: return resolution.verifiedTicker != nil && resolution.verifiedTicker == resolution.trimmedTicker
-        }
-    }
-
-    /// True while prices are being checked or any unpriced holding still needs the user's choice.
-    private var hasUnresolvedPrices: Bool {
-        displayEntries.contains { entry in
-            switch priceCheck(for: entry) {
-            case .checking: true
-            case .missing: !isResolved(entry)
-            case .ok, .notNeeded: false
-            }
-        }
     }
 
     private func resolution(_ id: UUID) -> Binding<PriceResolution> {
         Binding(
-            get: { priceResolutions[id] ?? PriceResolution() },
-            set: { priceResolutions[id] = $0 }
+            get: { model.priceResolutions[id] ?? PriceResolution() },
+            set: { model.priceResolutions[id] = $0 }
         )
     }
 
-    private func checkTicker(for id: UUID) async {
-        let ticker = resolution(id).wrappedValue.trimmedTicker
-        guard !ticker.isEmpty else { return }
-        priceResolutions[id, default: PriceResolution()].isCheckingTicker = true
-        let hasPrice = await store.hasLivePrice(symbol: ticker)
-        priceResolutions[id, default: PriceResolution()].isCheckingTicker = false
-        priceResolutions[id, default: PriceResolution()].verifiedTicker = hasPrice ? ticker : nil
-        priceResolutions[id, default: PriceResolution()].tickerFailed = !hasPrice
-    }
-
-    /// Entries ready for Apply: the user's price choices are written in, and confirmed tickers are remembered.
-    private func entriesForApply() -> [ParsedStatementEntry] {
-        effectiveEntries.map { entry in
-            guard priceCheck(for: entry) == .missing,
-                  let resolution = priceResolutions[entry.id], let mode = resolution.mode
-            else { return entry }
-
-            var entry = entry
-            switch mode {
-            case .manualPrice:
-                entry.manualPrice = NumberText.parse(resolution.priceText)
-            case .fromValue:
-                entry.manualPrice = valuePerUnit(for: entry)
-            case .ticker:
-                if let ticker = resolution.verifiedTicker {
-                    store.rememberTicker(ticker, for: entry)
-                    entry.symbol = ticker
-                    entry.symbolConfirmedByUser = true
-                }
-            }
-            return entry
-        }
-    }
+    // MARK: - Price Resolution
 
     @ViewBuilder
-    private func priceResolutionView(for entry: ParsedStatementEntry) -> some View {
+    private func priceResolutionView(for entry: ParsedStatementEntry, reason: String) -> some View {
         let binding = resolution(entry.id)
         let currency = entry.currencyCode ?? "GBP"
         VStack(alignment: .leading, spacing: 6) {
-            Label(
-                "No live price for \(pricingSymbol(for: entry) ?? entry.name). Choose how to price it:",
-                systemImage: "exclamationmark.triangle.fill"
-            )
-            .font(.caption)
-            .foregroundStyle(.orange)
+            Label("\(reason) Choose how to price it:", systemImage: "exclamationmark.triangle.fill")
+                .font(.caption)
+                .foregroundStyle(.orange)
 
             Picker("Price source", selection: binding.mode) {
                 Text("Choose…").tag(PriceResolution.Mode?.none)
                 Text("Enter a price").tag(PriceResolution.Mode?.some(.manualPrice))
-                if valuePerUnit(for: entry) != nil {
+                if model.valuePerUnit(for: entry) != nil {
                     Text("Value ÷ units").tag(PriceResolution.Mode?.some(.fromValue))
                 }
                 Text("Enter a ticker").tag(PriceResolution.Mode?.some(.ticker))
             }
             .pickerStyle(.menu)
             .font(.caption)
+            .accessibilityIdentifier("import.priceSource.\(entry.name)")
 
             switch binding.wrappedValue.mode {
             case .manualPrice?:
                 TextField("Price per unit in \(currency)", text: binding.priceText)
                     .keyboardType(.decimalPad)
                     .textFieldStyle(.roundedBorder)
+                    .accessibilityIdentifier("import.manualPrice.\(entry.name)")
                 if NumberText.isInvalid(binding.wrappedValue.priceText) {
                     Text("Invalid number").font(.caption).foregroundStyle(.red)
                 }
             case .fromValue?:
-                if let value = entry.value, let perUnit = valuePerUnit(for: entry) {
+                if let value = entry.value, let perUnit = model.valuePerUnit(for: entry) {
                     Text("\(value.formatted(.currency(code: currency))) ÷ \(entry.shares.formatted()) = \(perUnit.formatted(.currency(code: currency))) per unit")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -552,11 +339,12 @@ struct StatementImportPreviewSheet: View {
                         .textInputAutocapitalization(.characters)
                         .autocorrectionDisabled()
                         .textFieldStyle(.roundedBorder)
+                        .accessibilityIdentifier("import.ticker.\(entry.name)")
                     if binding.wrappedValue.isCheckingTicker {
                         ProgressView()
                     } else {
                         Button("Check") {
-                            Task { await checkTicker(for: entry.id) }
+                            Task { await model.checkTicker(for: entry) }
                         }
                         .buttonStyle(.borderless)
                         .disabled(binding.wrappedValue.trimmedTicker.isEmpty)
@@ -566,10 +354,18 @@ struct StatementImportPreviewSheet: View {
                     Label("\(verified) has a live price — it will be remembered for future imports", systemImage: "checkmark.circle.fill")
                         .font(.caption)
                         .foregroundStyle(.green)
-                } else if binding.wrappedValue.tickerFailed {
-                    Text("No price found for that ticker on Yahoo Finance.")
+                } else if let error = binding.wrappedValue.tickerError {
+                    Text(error)
                         .font(.caption)
                         .foregroundStyle(.red)
+                    // A price-range mismatch may just be an old statement — let the user decide
+                    if let mismatched = binding.wrappedValue.priceMismatchTicker, mismatched == binding.wrappedValue.trimmedTicker {
+                        Button("Use \(mismatched) anyway") {
+                            model.useTickerAnyway(forEntry: entry.id)
+                        }
+                        .buttonStyle(.borderless)
+                        .font(.caption)
+                    }
                 }
             case nil:
                 EmptyView()
@@ -577,6 +373,4 @@ struct StatementImportPreviewSheet: View {
         }
         .padding(.top, 4)
     }
-
-
 }

@@ -9,7 +9,8 @@ import Foundation
 import Security
 
 /// Stores the Claude API key in the Keychain so it never ships inside the app bundle.
-enum APIKeyStore {
+/// `nonisolated` because Keychain calls are thread-safe and the key is read from any context.
+nonisolated enum APIKeyStore {
     private static let service = "Investment-App.ClaudeAPI"
     private static let account = "CLAUDE_API_KEY"
 
