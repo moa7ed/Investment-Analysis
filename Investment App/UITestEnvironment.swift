@@ -59,6 +59,20 @@ enum UITestEnvironment {
                 // Numbers beyond the portfolio size are ignored by the app
                 return .json(StubHTTPClient.jsonString(["assignments": (1...20).map { ["number": $0, "sector": "Tech"] }]))
             }
+            if prompt.contains("Research the latest market news") {
+                return .json("Apple: analysts' consensus is a moderate buy. Sui: volatile week.")
+            }
+            if prompt.contains("Act as an experienced financial analyst") {
+                // Assumes the sample statement was imported: 1 = Apple, 2 = Sui
+                return .json(StubHTTPClient.jsonString([
+                    "summary": "Markets were calm this week. Apple was your biggest mover after strong iPhone sales.",
+                    "recommendations": [
+                        ["investment": 1, "recommendation": "buy", "reason": "Below target and analysts expect growth."],
+                        ["investment": 2, "recommendation": "hold", "reason": "Near target; wait for the volatility to settle."]
+                    ],
+                    "explainedTerms": [String]()
+                ]))
+            }
             return nil
         }
         return http

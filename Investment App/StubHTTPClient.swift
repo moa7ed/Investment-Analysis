@@ -62,6 +62,38 @@ nonisolated final class StubHTTPClient: HTTPClient, @unchecked Sendable {
         throw URLError(.notConnectedToInternet)
     }
 
+    /// Streams the same canned responses as `send`. A stubbed Claude message is replayed as server-sent events
+    /// (each block arriving whole in its `content_block_start`); any other body is returned line by line, so a
+    /// handler can also return raw SSE text.
+    func lines(for request: URLRequest) async throws -> (AsyncThrowingStream<String, Error>, URLResponse) {
+        let (data, response) = try await send(request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 200
+        let lines = Self.eventLines(fromMessage: data, status: status)
+            ?? String(decoding: data, as: UTF8.self).components(separatedBy: "\n")
+        let stream = AsyncThrowingStream<String, Error> { continuation in
+            lines.forEach { continuation.yield($0) }
+            continuation.finish()
+        }
+        return (stream, response)
+    }
+
+    /// SSE `data:` lines equivalent to a non-streaming Messages API reply, or nil if the body isn't one.
+    private static func eventLines(fromMessage data: Data, status: Int) -> [String]? {
+        guard status == 200,
+              let message = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let content = message["content"] as? [[String: Any]]
+        else { return nil }
+
+        var events: [[String: Any]] = [["type": "message_start", "message": ["content": []]]]
+        for (index, block) in content.enumerated() {
+            events.append(["type": "content_block_start", "index": index, "content_block": block])
+            events.append(["type": "content_block_stop", "index": index])
+        }
+        events.append(["type": "message_delta", "delta": ["stop_reason": message["stop_reason"] ?? NSNull()]])
+        events.append(["type": "message_stop"])
+        return events.map { "data: \(jsonString($0))" }
+    }
+
     // MARK: - Yahoo
 
     /// Answers Yahoo's chart API for an exact symbol.

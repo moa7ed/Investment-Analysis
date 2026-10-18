@@ -7,6 +7,7 @@
 
 import SwiftUI
 import PhotosUI
+import SwiftData
 import UniformTypeIdentifiers
 
 /// One statement in the import queue: either ready to send, or a file that couldn't be loaded.
@@ -29,15 +30,18 @@ struct ContentView: View {
     /// Statements to import as soon as the view appears (used by UI tests).
     private let initialImports: [StatementSource]
 
-    init(store: PortfolioStore, initialImports: [StatementSource] = []) {
+    /// - Parameter expandedSectors: Sectors shown open at first (used by previews).
+    init(store: PortfolioStore, initialImports: [StatementSource] = [], expandedSectors: Set<String> = []) {
         _store = State(initialValue: store)
         self.initialImports = initialImports
+        _expandedSectors = State(initialValue: expandedSectors)
     }
     @State private var selectedInvestment: Investment?
-    @State private var expandedSectors: Set<String> = []
+    @State private var expandedSectors: Set<String>
     @State private var scrollProxy: ScrollViewProxy?
     @State private var showReclassifySheet = false
     @State private var showTargets = false
+    @State private var showMarketAnalysis = false
     @State private var showAddInvestment = false
     @State private var showFileImporter = false
     @State private var showPhotosPicker = false
@@ -57,11 +61,14 @@ struct ContentView: View {
     @State private var investmentToDelete: Investment?
     @Environment(\.scenePhase) private var scenePhase
     @State private var searchText = ""
+    /// Bumped when broker logos finish loading, so the Broker dropdown is rebuilt with them
+    @State private var brokerLogosLoaded = 0
 
     var body: some View {
         NavigationStack {
             Group {
-                if store.isLoading && !store.hasFetchedOnce {
+                // Only the very first launch waits; afterwards the saved prices show while new ones load
+                if store.isLoading && !store.hasFetchedOnce && store.lastPriceRefresh == nil {
                     loadingView
                 } else {
                     mainContent
@@ -133,6 +140,15 @@ struct ContentView: View {
             }
             .sheet(isPresented: $showTargets) {
                 TargetsView(store: store)
+            }
+            .sheet(isPresented: $showMarketAnalysis) {
+                MarketAnalysisView(store: store)
+            }
+            // Tapping an "analysis ready" notification opens the analysis
+            .onChange(of: AnalysisNotificationRouter.shared.opensMarketAnalysis) { _, opens in
+                guard opens else { return }
+                AnalysisNotificationRouter.shared.opensMarketAnalysis = false
+                showMarketAnalysis = true
             }
             .sheet(isPresented: $showReclassifySheet) {
                 ReclassifySheet(store: store)
@@ -262,6 +278,9 @@ struct ContentView: View {
                 VStack(spacing: 20) {
                     portfolioHeader
 
+                    marketAnalysisButton
+                        .padding(.horizontal)
+
                     if !store.targetsAddUpTo100 {
                         targetWarning
                             .padding(.horizontal)
@@ -273,10 +292,8 @@ struct ContentView: View {
                     if isSearching {
                         searchResults
                     } else {
-                        sectorBarChart
+                        sectorCards
                             .padding(.horizontal)
-
-                        sectorList
 
                         totalCard
                             .padding(.horizontal)
@@ -380,14 +397,72 @@ struct ContentView: View {
                  : "Total Value")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            HStack(spacing: 8) {
-                Text(store.totalPortfolioValue, format: .currency(code: "GBP").precision(.fractionLength(0)))
-                    .font(.largeTitle.bold())
-                if store.isLoading {
+            Text(store.totalPortfolioValue, format: .currency(code: "GBP").precision(.fractionLength(0)))
+                .font(.largeTitle.bold())
+                .contentTransition(.numericText(value: store.totalPortfolioValue))
+                .animation(.default, value: store.totalPortfolioValue)
+            priceRefreshStatus
+        }
+    }
+
+    /// "Updating prices…" while a refresh runs, otherwise how old the shown prices are.
+    @ViewBuilder
+    private var priceRefreshStatus: some View {
+        if store.isLoading {
+            HStack(spacing: 6) {
+                ProgressView()
+                    .controlSize(.mini)
+                Text("Updating prices…")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .accessibilityIdentifier("home.updatingPrices")
+        } else if let lastRefresh = store.lastPriceRefresh {
+            // Re-rendered each minute, e.g. "Updated 5 minutes ago"
+            TimelineView(.periodic(from: .now, by: 60)) { context in
+                Text("Updated \(lastRefresh.formatted(.relative(presentation: .named, unitsStyle: .wide)))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .accessibilityIdentifier("home.lastUpdated")
+        }
+    }
+
+    // MARK: - Market Analysis
+
+    /// The app's headline feature: Claude's market analysis and buy/sell/hold advice for the portfolio.
+    private var marketAnalysisButton: some View {
+        Button {
+            showMarketAnalysis = true
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: "sparkles")
+                    .font(.title2)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Market Analysis")
+                        .font(.headline)
+                    Text(store.marketAnalysisPhase?.message ?? "Buy, sell or hold advice for your portfolio")
+                        .font(.caption)
+                        .opacity(0.85)
+                }
+                Spacer()
+                if store.marketAnalysisPhase != nil {
                     ProgressView()
+                        .tint(.white)
+                } else {
+                    Image(systemName: "chevron.right")
+                        .font(.caption.bold())
                 }
             }
+            .foregroundStyle(.white)
+            .padding()
+            .background(
+                LinearGradient(colors: [.indigo, .purple], startPoint: .leading, endPoint: .trailing),
+                in: RoundedRectangle(cornerRadius: 14)
+            )
         }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("home.marketAnalysis")
     }
 
     // MARK: - Target Warning
@@ -433,8 +508,15 @@ struct ContentView: View {
                 title: "Broker",
                 selection: $store.brokerFilter,
                 options: store.filterBrokers,
-                identifier: "filter.broker"
+                identifier: "filter.broker",
+                showsBrokerIcon: true
             )
+            // Fetch the logos up front so the dropdown can show them; rebuild it once they're in
+            .id(brokerLogosLoaded)
+            .task(id: store.filterBrokers) {
+                await BrokerLogos.preload(store.filterBrokers)
+                brokerLogosLoaded += 1
+            }
             filterMenu(
                 title: "Type",
                 selection: $store.accountTypeFilter,
@@ -453,16 +535,29 @@ struct ContentView: View {
         }
     }
 
-    private func filterMenu(title: String, selection: Binding<String?>, options: [String], identifier: String) -> some View {
+    /// - Parameter showsBrokerIcon: Puts the selected broker's logo in the chip.
+    private func filterMenu(
+        title: String, selection: Binding<String?>, options: [String], identifier: String, showsBrokerIcon: Bool = false
+    ) -> some View {
         Menu {
             Picker(title, selection: selection) {
                 Text("All").tag(String?.none)
                 ForEach(options, id: \.self) { option in
-                    Text(option).tag(String?.some(option))
+                    Group {
+                        if showsBrokerIcon {
+                            BrokerMenuLabel(broker: option)
+                        } else {
+                            Text(option)
+                        }
+                    }
+                    .tag(String?.some(option))
                 }
             }
         } label: {
             HStack(spacing: 4) {
+                if showsBrokerIcon, let broker = selection.wrappedValue {
+                    BrokerIconView(broker: broker, size: 16)
+                }
                 Text("\(title): \(selection.wrappedValue ?? "All")")
                     .lineLimit(1)
                 Image(systemName: "chevron.down")
@@ -480,103 +575,141 @@ struct ContentView: View {
         .accessibilityIdentifier(identifier)
     }
 
-    // MARK: - Sector Bar Chart
+    // MARK: - Sectors
 
-    private var sectorBarChart: some View {
+    /// One card per sector: icon, name and value, a bar (fill = current share, tick = target), and the gap.
+    /// Tapping a card expands its investments in place. Bars stay neutral unless the sector is outside the
+    /// on-target band (orange over, blue under), so the few that need attention stand out.
+    private var sectorCards: some View {
         let sectors = store.investmentsBySector
-        let total = store.totalPortfolioValue
-        let hasSelection = !expandedSectors.isEmpty
 
-        // Max current percentage across sectors — used to scale bar widths
-        let maxPct = sectors.map { store.sectorCurrentPercentage($0.sector) }.max() ?? 1
+        // Bars and target ticks share one scale, so a tick past the end of its bar means "under"
+        let scaleMax = sectors
+            .map { max(store.sectorCurrentPercentage($0.sector), store.sectorTargetPercentage($0.sector)) }
+            .max() ?? 0
 
-        // Dynamic ceiling: the largest GBP gap across all sectors
-        let maxGap: Double = {
-            let gaps = sectors.map { group -> Double in
-                let currentVal = store.sectorValue(group.sector)
-                let targetVal = total * store.sectorTargetPercentage(group.sector) / 100.0
-                return abs(currentVal - targetVal)
-            }
-            return gaps.max() ?? 1
-        }()
-
-        return VStack(spacing: 4) {
+        return VStack(spacing: 6) {
             ForEach(sectors, id: \.sector) { group in
-                let curPct = store.sectorCurrentPercentage(group.sector)
-                let tgtPct = store.sectorTargetPercentage(group.sector)
-                let value = store.sectorValue(group.sector)
                 let isExpanded = expandedSectors.contains(group.sector)
 
-                let targetValue = total * tgtPct / 100.0
-                let gbpGap = abs(value - targetValue)
-                let intensity = maxGap > 0 ? 0.3 + (gbpGap / maxGap) * 0.7 : 0.3
-                let baseColor: Color = {
-                    if value == 0 && tgtPct == 0 { return .gray }
-                    if value == 0 { return .red }
-                    return curPct >= tgtPct ? .green : .red
-                }()
-                let fillOpacity: Double = {
-                    if isExpanded { return intensity }
-                    if hasSelection { return intensity * 0.35 }
-                    return intensity * 0.7
-                }()
-
-                // Bar width fraction relative to the largest sector
-                let barFraction = maxPct > 0 ? curPct / maxPct : 0
-
-                GeometryReader { geo in
-                    ZStack(alignment: .leading) {
-                        // Background track
-                        RoundedRectangle(cornerRadius: 6)
-                            .fill(Color(.systemGray6))
-
-                        // Filled bar
-                        RoundedRectangle(cornerRadius: 6)
-                            .fill(baseColor.opacity(fillOpacity))
-                            .frame(width: max(0, geo.size.width * barFraction))
-
-                        // Border for expanded
-                        if isExpanded {
-                            RoundedRectangle(cornerRadius: 6)
-                                .stroke(Color.primary, lineWidth: 2)
-                        }
-
-                        // Labels
-                        HStack {
-                            Text(group.sector)
-                                .font(.subheadline.bold())
-                                .lineLimit(1)
-
-                            Spacer()
-
-                            HStack(spacing: 4) {
-                                Text(formatPct(curPct))
-                                    .foregroundStyle(baseColor)
-                                Text("/ \(formatPct(tgtPct))")
-                                    .foregroundStyle(.secondary)
-
-                                let diff = value - targetValue
-                                Text("(\(diff >= 0 ? "+" : "")\(diff.formatted(.currency(code: "GBP").precision(.fractionLength(0)))))")
-                                    .foregroundStyle(diff >= 0 ? .green : .red)
+                VStack(spacing: 0) {
+                    sectorHeader(group.sector, scaleMax: scaleMax, isExpanded: isExpanded)
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            withAnimation(.easeInOut(duration: 0.25)) {
+                                toggleSector(group.sector)
                             }
-                            .font(.caption)
+                            if !isExpanded {
+                                scrollToSector(group.sector)
+                            }
                         }
-                        .padding(.horizontal, 10)
+
+                    if isExpanded {
+                        VStack(spacing: 0) {
+                            ForEach(group.items) { investment in
+                                Divider()
+                                    .padding(.leading, 12)
+                                investmentActions(investmentRow(investment), for: investment)
+                            }
+                        }
+                        .padding(.bottom, 4)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                        .id("bottom-\(group.sector)")
                     }
                 }
-                .frame(height: 40)
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    let willExpand = !isExpanded
-                    withAnimation(.easeInOut(duration: 0.25)) {
-                        toggleSector(group.sector)
-                    }
-                    if willExpand {
-                        scrollToSector(group.sector)
-                    }
-                }
+                .background(Color(.systemGray6).opacity(0.5), in: RoundedRectangle(cornerRadius: 12))
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .id(group.sector)
             }
         }
+    }
+
+    private func sectorHeader(_ sector: String, scaleMax: Double, isExpanded: Bool) -> some View {
+        let value = store.sectorValue(sector)
+        let curPct = store.sectorCurrentPercentage(sector)
+        let tgtPct = store.sectorTargetPercentage(sector)
+        let gap = sectorGap(sector)
+        let barFraction = scaleMax > 0 ? curPct / scaleMax : 0
+        let targetFraction = scaleMax > 0 ? tgtPct / scaleMax : 0
+        let icon = AssetIcons.sector(sector)
+
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                AssetIconView(symbol: icon.symbol, color: icon.color)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(sector)
+                        .font(.subheadline.bold())
+                        .lineLimit(1)
+                    HStack(spacing: 6) {
+                        Text("\(formatPct(curPct)) / \(formatPct(tgtPct))")
+                            .foregroundStyle(.secondary)
+                        if !gap.isEmpty {
+                            gap.label
+                                .foregroundStyle(gap.labelStyle)
+                        }
+                    }
+                    .font(.caption)
+                    .monospacedDigit()
+                }
+
+                Spacer()
+
+                Text(value > 0
+                     ? value.formatted(.currency(code: "GBP").precision(.fractionLength(0)))
+                     : "—")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+
+                Image(systemName: "chevron.right")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .rotationEffect(.degrees(isExpanded ? 90 : 0))
+            }
+
+            // Thin track: fill = current share, tick = target
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule()
+                        .fill(Color(.systemGray5))
+                        .frame(height: 8)
+                    Capsule()
+                        .fill(gap.color.opacity(gap.isOnTarget ? 0.45 : 0.9))
+                        .frame(width: max(0, geo.size.width * barFraction), height: 8)
+                    if tgtPct > 0 {
+                        Capsule()
+                            .fill(Color.primary)
+                            .frame(width: 2, height: 16)
+                            .offset(x: min(max(geo.size.width * targetFraction - 1, 0), geo.size.width - 2))
+                    }
+                }
+                .frame(maxHeight: .infinity)
+            }
+            .frame(height: 16)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(sector), \(value.formatted(.currency(code: "GBP").precision(.fractionLength(0)))), \(formatPct(curPct)) of portfolio, target \(formatPct(tgtPct)). \(gap.accessibilityDescription)")
+        .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
+        .accessibilityAddTraits(.isButton)
+    }
+
+    private func sectorGap(_ sector: String) -> TargetGap {
+        let target = store.sectorTargetPercentage(sector)
+        return TargetGap(
+            currentPercentage: store.sectorCurrentPercentage(sector),
+            targetPercentage: target,
+            amountGBP: store.sectorValue(sector) - store.totalPortfolioValue * target / 100
+        )
+    }
+
+    private func investmentGap(_ investment: Investment) -> TargetGap {
+        TargetGap(
+            currentPercentage: store.currentPercentage(for: investment),
+            targetPercentage: investment.targetPercentage,
+            amountGBP: store.valueInGBP(for: investment) - store.totalPortfolioValue * investment.targetPercentage / 100
+        )
     }
 
     private func toggleSector(_ sector: String) {
@@ -587,113 +720,16 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Sector List
-
-    private var sectorList: some View {
-        VStack(spacing: 2) {
-            ForEach(store.investmentsBySector, id: \.sector) { group in
-                VStack(spacing: 0) {
-                    // Sector row
-                    sectorListRow(group.sector)
-                        .onTapGesture {
-                            withAnimation(.easeInOut(duration: 0.25)) {
-                                toggleSector(group.sector)
-                            }
-                        }
-
-                    // Expanded investments
-                    if expandedSectors.contains(group.sector) {
-                        VStack(spacing: 0) {
-                            ForEach(group.items) { investment in
-                                Divider()
-                                    .padding(.leading, 34)
-                                investmentActions(investmentRow(investment), for: investment)
-                            }
-                        }
-                        .padding(.bottom, 4)
-                        .background(Color(.systemGray6).opacity(0.3), in: RoundedRectangle(cornerRadius: 0))
-                        .clipShape(
-                            UnevenRoundedRectangle(
-                                bottomLeadingRadius: 10,
-                                bottomTrailingRadius: 10
-                            )
-                        )
-                        .id("bottom-\(group.sector)")
-                    }
-                }
-                .id(group.sector)
-            }
-        }
-        .padding(.horizontal)
-    }
-
-    private func sectorListRow(_ sector: String) -> some View {
-        let value = store.sectorValue(sector)
-        let curPct = store.sectorCurrentPercentage(sector)
-        let tgtPct = store.sectorTargetPercentage(sector)
-        let isExpanded = expandedSectors.contains(sector)
-        let statusColor: Color = {
-            if value == 0 { return .secondary }
-            return curPct >= tgtPct ? .green : .red
-        }()
-
-        return HStack(spacing: 12) {
-            Circle()
-                .fill(statusColor)
-                .frame(width: 10, height: 10)
-
-            let icon = AssetIcons.sector(sector)
-            AssetIconView(symbol: icon.symbol, color: icon.color)
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(sector)
-                    .font(.subheadline.bold())
-                HStack(spacing: 4) {
-                    Text(formatPct(curPct))
-                        .foregroundStyle(statusColor)
-                    Text("/ \(formatPct(tgtPct))")
-                        .foregroundStyle(.secondary)
-                }
-                .font(.caption2)
-            }
-
-            Spacer()
-
-            Text(value > 0
-                 ? value.formatted(.currency(code: "GBP").precision(.fractionLength(0)))
-                 : "—")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-
-            Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                .font(.caption)
-                .foregroundStyle(.tertiary)
-        }
-        .padding(.vertical, 10)
-        .padding(.horizontal, 12)
-        .background(
-            Color(.systemGray6).opacity(0.5),
-            in: isExpanded
-                ? AnyShape(UnevenRoundedRectangle(topLeadingRadius: 10, topTrailingRadius: 10))
-                : AnyShape(RoundedRectangle(cornerRadius: 10))
-        )
-        .contentShape(Rectangle())
-    }
-
     // MARK: - Investment Row
 
     /// - Parameter showsSector: Adds the symbol and sector under the name (search results aren't grouped by sector).
     private func investmentRow(_ investment: Investment, showsSector: Bool = false) -> some View {
         let gbpValue = store.valueInGBP(for: investment)
         let currentPct = store.currentPercentage(for: investment)
-        let statusColor: Color = {
-            if gbpValue == 0 && investment.targetPercentage == 0 { return .secondary }
-            if gbpValue == 0 { return .secondary }
-            return currentPct >= investment.targetPercentage ? .green : .red
-        }()
+        let gap = investmentGap(investment)
 
         return HStack(spacing: 10) {
-            // Sits under the sector icon (the row's leading padding matches the sector row's dot + spacing)
+            // Indented past the sector icon, so rows read as belonging to the sector card above
             InvestmentLogoView(symbol: investment.symbol, category: investment.category)
                 .frame(width: 28)
 
@@ -710,18 +746,17 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
-                HStack(spacing: 4) {
-                    Text(formatPct(currentPct))
-                        .foregroundStyle(statusColor)
-                    Text("/ \(formatPct(investment.targetPercentage))")
+                HStack(spacing: 6) {
+                    Text("\(formatPct(currentPct)) / \(formatPct(investment.targetPercentage))")
                         .foregroundStyle(.secondary)
-
-                    let targetValue = store.totalPortfolioValue * investment.targetPercentage / 100.0
-                    let diff = gbpValue - targetValue
-                    Text("(\(diff >= 0 ? "+" : "")\(diff.formatted(.currency(code: "GBP").precision(.fractionLength(0)))))")
-                        .foregroundStyle(diff >= 0 ? .green : .red)
+                    if !gap.isEmpty {
+                        gap.label
+                            .foregroundStyle(gap.labelStyle)
+                            .accessibilityLabel(gap.accessibilityDescription)
+                    }
                 }
                 .font(.caption2)
+                .monospacedDigit()
             }
             Spacer()
             Text(gbpValue > 0
@@ -998,4 +1033,33 @@ struct ReclassifySheet: View {
 
 #Preview {
     ContentView(store: PortfolioStore())
+        .modelContainer(for: AnalysisRecord.self, inMemory: true)
 }
+
+#if DEBUG
+#Preview("Sample portfolio") {
+    // Offline store: Tech over target, Crypto under, Index Funds on target
+    let suite = "Investment-App.Preview"
+    let defaults = UserDefaults(suiteName: suite)!
+    defaults.removePersistentDomain(forName: suite)
+    // As if prices were refreshed before, so the portfolio shows while the (offline) refresh runs
+    defaults.set(Date(), forKey: "last_price_refresh")
+    let store = PortfolioStore(defaults: defaults, http: StubHTTPClient(), apiKeyProvider: { nil })
+    func investment(_ name: String, _ symbol: String, sector: String, value: Double, target: Double) -> Investment {
+        var investment = Investment(name: name, symbol: symbol, targetPercentage: target, currencyCode: "GBP",
+                                    holdings: [Holding(broker: "Trading 212", accountType: "ISA", shares: 1)])
+        investment.apiPrice = value
+        investment.sector = sector
+        return investment
+    }
+    store.investments = [
+        investment("Apple", "AAPL", sector: "Tech", value: 2_000, target: 15),
+        investment("Microsoft", "MSFT", sector: "Tech", value: 1_200, target: 10),
+        investment("Bitcoin", "BTC-USD", sector: "Crypto", value: 800, target: 12),
+        investment("Vanguard S&P 500", "VUSA.L", sector: "Index Funds", value: 4_000, target: 41),
+        investment("Gold", "GC=F", sector: "Commodities", value: 2_000, target: 22)
+    ]
+    return ContentView(store: store, expandedSectors: ["Tech"])
+        .modelContainer(for: AnalysisRecord.self, inMemory: true)
+}
+#endif

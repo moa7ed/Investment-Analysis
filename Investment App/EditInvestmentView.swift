@@ -91,12 +91,11 @@ struct EditInvestmentView: View {
                     ForEach($holdingDrafts) { $draft in
                         VStack(alignment: .trailing, spacing: 2) {
                             HStack {
+                                BrokerIconView(broker: draft.broker, size: 28)
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(draft.broker)
                                         .font(.subheadline)
-                                    Text(draft.accountType)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
+                                    accountTypePicker($draft.accountType)
                                 }
                                 Spacer()
                                 TextField("Shares", text: $draft.sharesText)
@@ -105,6 +104,12 @@ struct EditInvestmentView: View {
                                     .frame(width: 100)
                             }
                             invalidHint(draft.sharesText)
+                            if isDuplicate(draft) {
+                                Text("Same broker and type as another holding — they'll be combined when saved.")
+                                    .font(.caption)
+                                    .foregroundStyle(.orange)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
                         }
                     }
                     .onDelete { indexSet in
@@ -220,9 +225,7 @@ struct EditInvestmentView: View {
                         investment.manualPrice = NumberText.parse(manualPriceText)
                         investment.currencyCode = currencyCode
                         investment.manualValue = NumberText.parse(manualValueText)
-                        investment.holdings = holdingDrafts.map {
-                            Holding(broker: $0.broker, accountType: $0.accountType, shares: NumberText.parse($0.sharesText) ?? 0)
-                        }
+                        investment.holdings = mergedHoldings()
                         investment.targetPercentage = NumberText.parse(targetPctText) ?? 0
                         investment.sector = sectorText.trimmingCharacters(in: .whitespaces).isEmpty
                             ? nil : sectorText.trimmingCharacters(in: .whitespaces)
@@ -233,6 +236,56 @@ struct EditInvestmentView: View {
                 }
             }
         }
+    }
+
+    /// Compact menu for a holding's account type; keeps a non-standard type (e.g. from an older import) selectable.
+    private func accountTypePicker(_ selection: Binding<String>) -> some View {
+        Menu {
+            Picker("Type", selection: selection) {
+                ForEach(Holding.standardAccountTypes, id: \.self) { type in
+                    Text(type).tag(type)
+                }
+                if !Holding.standardAccountTypes.contains(selection.wrappedValue) {
+                    Text(selection.wrappedValue).tag(selection.wrappedValue)
+                }
+            }
+        } label: {
+            HStack(spacing: 2) {
+                Text(selection.wrappedValue)
+                Image(systemName: "chevron.up.chevron.down")
+                    .imageScale(.small)
+            }
+            .font(.caption)
+        }
+        .accessibilityLabel("Account type: \(selection.wrappedValue)")
+        .accessibilityIdentifier("holding.accountType")
+    }
+
+    /// Holdings are keyed by broker and account type elsewhere in the app, so two rows can't share both.
+    private func holdingKey(broker: String, accountType: String) -> String {
+        "\(PortfolioStore.normalizeBroker(broker))|\(accountType.lowercased())"
+    }
+
+    private func isDuplicate(_ draft: HoldingDraft) -> Bool {
+        let key = holdingKey(broker: draft.broker, accountType: draft.accountType)
+        return holdingDrafts.contains { $0.id != draft.id && holdingKey(broker: $0.broker, accountType: $0.accountType) == key }
+    }
+
+    /// The edited holdings, with rows that now share a broker and account type combined (shares added up).
+    private func mergedHoldings() -> [Holding] {
+        var merged: [Holding] = []
+        var indexByKey: [String: Int] = [:]
+        for draft in holdingDrafts {
+            let shares = NumberText.parse(draft.sharesText) ?? 0
+            let key = holdingKey(broker: draft.broker, accountType: draft.accountType)
+            if let index = indexByKey[key] {
+                merged[index].shares += shares
+            } else {
+                indexByKey[key] = merged.count
+                merged.append(Holding(broker: draft.broker, accountType: draft.accountType, shares: shares))
+            }
+        }
+        return merged
     }
 
     /// True if any numeric field contains text that isn't a valid number — Save is blocked so nothing is silently dropped.
