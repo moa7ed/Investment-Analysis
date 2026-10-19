@@ -29,15 +29,23 @@ struct StatementImportPreviewSheet: View {
         NavigationStack {
             List {
                 Section {
-                    TextField("Broker name", text: $model.brokerText)
-                        .autocorrectionDisabled()
-                        .accessibilityIdentifier("import.broker")
+                    HStack(spacing: 10) {
+                        if !model.trimmedBroker.isEmpty {
+                            BrokerIconView(broker: model.trimmedBroker, size: 28)
+                        }
+                        TextField("Broker name", text: $model.brokerText)
+                            .autocorrectionDisabled()
+                            .accessibilityIdentifier("import.broker")
+                    }
                     if !model.knownBrokers.isEmpty {
                         Menu("Choose an existing broker") {
                             ForEach(model.knownBrokers, id: \.self) { broker in
-                                Button(broker) { model.brokerText = broker }
+                                Button { model.brokerText = broker } label: {
+                                    BrokerMenuLabel(broker: broker)
+                                }
                             }
                         }
+                        .task { await BrokerLogos.preload(model.knownBrokers) }
                     }
                 } header: {
                     Text("Broker")
@@ -210,6 +218,7 @@ struct StatementImportPreviewSheet: View {
                 }
                 if let broker = entry.broker {
                     Spacer()
+                    BrokerIconView(broker: broker, size: 14)
                     Text([broker, entry.accountType].compactMap { $0 }.joined(separator: " · "))
                         .font(.caption2)
                         .foregroundStyle(.tertiary)

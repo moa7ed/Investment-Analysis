@@ -7,29 +7,96 @@
 
 import Foundation
 import Observation
+import OSLog
 
 // MARK: - Claude API
 
 /// Why a Claude request produced no usable result.
-enum ClaudeFailure: Error {
+enum ClaudeFailure: Error, Equatable {
     case missingKey
     /// Claude's safety filters declined the request (`stop_reason: "refusal"`).
     case refused
     /// Network, HTTP, or decoding failure.
     case failed
+    /// The API returned an error (HTTP status, or 200 with an error event mid-stream), with its message.
+    case api(status: Int, message: String)
+    /// The request didn't reach the API or the connection dropped.
+    case network(String)
+    /// Claude replied, but the reply couldn't be used (cut off, wrong format, empty), with the reason.
+    case invalidResponse(String)
+    /// A failure in one step of a multi-step task (e.g. "Researching the market").
+    indirect case during(step: String, ClaudeFailure)
+    /// iOS stopped the work, or never allowed it to run in the background; the message says which.
+    case backgroundStopped(String)
+
+    /// The connection was cancelled or dropped (rather than Claude or the API reporting a problem).
+    var isConnectionFailure: Bool {
+        switch self {
+        case .network: true
+        case .during(_, let failure): failure.isConnectionFailure
+        default: false
+        }
+    }
 
     var message: String {
         switch self {
         case .missingKey: "Add your Claude API key in Settings."
         case .refused: "Claude declined to process this request."
         case .failed: "The request to Claude failed. Check your connection and try again."
+        case .api(let status, let message):
+            switch status {
+            case 401: "Claude rejected the API key. Check it in Settings. (\(message))"
+            case 429: "Claude's rate limit was reached. Wait a minute and try again. (\(message))"
+            case 529: "Claude is overloaded right now. Try again in a few minutes. (\(message))"
+            default: "Claude API error (\(status)): \(message)"
+            }
+        case .network(let description): "Couldn't reach Claude: \(description)"
+        case .invalidResponse(let reason): reason
+        case .during(let step, let failure): "\(step) failed. \(failure.message)"
+        case .backgroundStopped(let reason): reason
         }
+    }
+
+    /// Reads the message from an API error body (`{"type": "error", "error": {"type", "message"}}`).
+    static func apiError(status: Int, body: Data) -> ClaudeFailure {
+        let error = (try? JSONSerialization.jsonObject(with: body) as? [String: Any])?["error"] as? [String: Any]
+        let message = error?["message"] as? String
+            ?? String(data: body, encoding: .utf8).map { String($0.prefix(300)) }
+            ?? "no details"
+        return .api(status: status, message: message)
     }
 }
 
-private enum ClaudeAPI {
+/// Claude request failures go to the system log (visible in Console.app and Xcode, even when the app
+/// wasn't launched from Xcode), filterable by the "Claude" category.
+enum ClaudeLog {
+    static let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "Investment-App", category: "Claude")
+}
+
+enum ClaudeAPI {
     static let model = "claude-opus-5"
     static let endpoint = URL(string: "https://api.anthropic.com/v1/messages")!
+    /// Beta header for `fallbacks: "default"`, which retries a declined request on the model Anthropic recommends.
+    static let fallbackBeta = "server-side-fallback-2026-07-01"
+
+    /// A Messages API POST with the key, version and (optionally) server-side refusal fallback set.
+    static func makeRequest(body: [String: Any], apiKey: String, timeout: TimeInterval, allowFallback: Bool) -> URLRequest? {
+        var body = body
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "content-type")
+        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        if allowFallback {
+            request.setValue(fallbackBeta, forHTTPHeaderField: "anthropic-beta")
+            body["fallbacks"] = "default"
+        }
+        request.timeoutInterval = timeout
+
+        guard let httpBody = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+        request.httpBody = httpBody
+        return request
+    }
 
     /// The parts of a Messages API response the app reads.
     private struct MessagesResponse: Decodable {
@@ -52,17 +119,12 @@ private enum ClaudeAPI {
         schema: [String: Any],
         as type: T.Type,
         maxTokens: Int = 4096,
+        timeout: TimeInterval = 120,
+        allowFallback: Bool = false,
         http: any HTTPClient,
         apiKey: String?
     ) async -> Result<T, ClaudeFailure> {
         guard let apiKey else { return .failure(.missingKey) }
-
-        var request = URLRequest(url: endpoint)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "content-type")
-        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
-        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-        request.timeoutInterval = 120
 
         let body: [String: Any] = [
             "model": model,
@@ -70,9 +132,9 @@ private enum ClaudeAPI {
             "output_config": ["format": ["type": "json_schema", "schema": schema]],
             "messages": [["role": "user", "content": contentBlocks]]
         ]
-
-        guard let httpBody = try? JSONSerialization.data(withJSONObject: body) else { return .failure(.failed) }
-        request.httpBody = httpBody
+        guard let request = makeRequest(body: body, apiKey: apiKey, timeout: timeout, allowFallback: allowFallback) else {
+            return .failure(.failed)
+        }
 
         do {
             let (data, response) = try await http.send(request)
@@ -94,7 +156,8 @@ private enum ClaudeAPI {
                 break
             }
 
-            guard let text = decoded.content.first(where: { $0.type == "text" })?.text else {
+            // The last text block is the answer (after a fallback, earlier blocks are the declined model's partial output)
+            guard let text = decoded.content.last(where: { $0.type == "text" })?.text else {
                 return .failure(.failed)
             }
             do {
@@ -107,6 +170,103 @@ private enum ClaudeAPI {
             print("[ClaudeAPI] Error: \(error)")
             return .failure(.failed)
         }
+    }
+
+    // MARK: Web research
+
+    /// What Claude found with web search: its written notes and the pages it cited.
+    struct Research {
+        let notes: String
+        let sources: [AnalysisSource]
+    }
+
+    /// How many times a paused search turn is resumed before using what Claude has written so far.
+    private static let maxContinuations = 5
+
+    /// Sends a prompt with web search enabled and returns Claude's findings, streaming progress through `onEvent`.
+    /// Long research can pause (`stop_reason: "pause_turn"`); the paused turn is sent back unchanged so the server resumes it.
+    static func research(
+        _ prompt: String,
+        maxSearches: Int,
+        maxTokens: Int = 24000,
+        http: any HTTPClient,
+        apiKey: String?,
+        onEvent: (ClaudeStreamEvent) -> Void = { _ in }
+    ) async -> Result<Research, ClaudeFailure> {
+        guard let apiKey else { return .failure(.missingKey) }
+
+        let userMessage: [String: Any] = ["role": "user", "content": [["type": "text", "text": prompt]]]
+        let tools: [[String: Any]] = [[
+            "type": "web_search_20260209",
+            "name": "web_search",
+            "max_uses": maxSearches,
+            "user_location": ["type": "approximate", "country": "GB", "timezone": "Europe/London"]
+        ]]
+        // Every block Claude has produced so far, resent as one assistant turn when continuing a pause
+        var assistantContent: [[String: Any]] = []
+
+        for attempt in 0...maxContinuations {
+            var messages = [userMessage]
+            if !assistantContent.isEmpty {
+                messages.append(["role": "assistant", "content": echoableContent(assistantContent)])
+            }
+            let body: [String: Any] = [
+                "model": model,
+                "max_tokens": maxTokens,
+                "thinking": summarizedThinking,
+                // Gathering news needs less reasoning than the analysis itself, which stays at the default (high)
+                "output_config": ["effort": "medium"],
+                // Caches the conversation so far: resuming a paused turn re-reads it at the cached-input price
+                "cache_control": ["type": "ephemeral"],
+                "tools": tools,
+                "messages": messages
+            ]
+
+            let reply: StreamedMessage
+            switch await streamMessage(body: body, apiKey: apiKey, timeout: 300, allowFallback: true, http: http, onEvent: onEvent) {
+            case .success(let value): reply = value
+            case .failure(let failure):
+                ClaudeLog.logger.error("Research request \(attempt + 1, privacy: .public) failed: \(failure.message, privacy: .public)")
+                return .failure(failure)
+            }
+
+            ClaudeLog.logger.info("Research request \(attempt + 1, privacy: .public) finished: stop_reason=\(reply.stopReason ?? "none", privacy: .public), \(reply.content.count, privacy: .public) blocks")
+            assistantContent += reply.content
+            switch reply.stopReason {
+            case "pause_turn":
+                continue
+            case "refusal":
+                return .failure(.refused)
+            default:
+                // end_turn, or max_tokens — notes cut short are still worth analysing
+                return research(from: assistantContent)
+            }
+        }
+        ClaudeLog.logger.notice("Research still paused after \(maxContinuations, privacy: .public) continuations; using notes so far")
+        return research(from: assistantContent)
+    }
+
+    /// Joins the text Claude wrote (citations split it into several blocks) and collects the cited pages.
+    private static func research(from content: [[String: Any]]) -> Result<Research, ClaudeFailure> {
+        // After a fallback, only the blocks from the model that answered count
+        let lastFallback = content.lastIndex { $0["type"] as? String == "fallback" }
+        let answer = lastFallback.map { Array(content[content.index(after: $0)...]) } ?? content
+        let textBlocks = answer.filter { $0["type"] as? String == "text" }
+
+        let notes = textBlocks.compactMap { $0["text"] as? String }.joined()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !notes.isEmpty else {
+            return .failure(.invalidResponse("Claude finished researching without writing any notes."))
+        }
+
+        var seen = Set<String>()
+        let sources = textBlocks
+            .flatMap { $0["citations"] as? [[String: Any]] ?? [] }
+            .compactMap { citation -> AnalysisSource? in
+                guard let url = citation["url"] as? String, seen.insert(url).inserted else { return nil }
+                return AnalysisSource(title: citation["title"] as? String ?? url, url: url)
+            }
+        return .success(Research(notes: notes, sources: sources))
     }
 
     // MARK: Schema helpers
@@ -216,6 +376,8 @@ class PortfolioStore {
     var investments: [Investment] = []
     var isLoading = false
     var hasFetchedOnce = false
+    /// When prices and exchange rates were last refreshed (persisted, so the app opens with the saved values)
+    private(set) var lastPriceRefresh: Date?
     var exchangeRates: [String: Double] = ["GBP": 1.0, "GBX": 0.01]
     private var priceFetchTask: Task<Void, Never>?
     /// Investments whose symbol returned no price on the last refresh (not persisted — rechecked every refresh).
@@ -225,6 +387,8 @@ class PortfolioStore {
 
     private let userDefaultsKey = "portfolio_investments"
     private let tickerOverridesKey = "ticker_overrides"
+    private let exchangeRatesKey = "exchange_rates"
+    private let lastPriceRefreshKey = "last_price_refresh"
     private let dataResetKey = "data_reset_v8_cash_consolidation"
     /// nonisolated so it can be used as a default argument (an immutable Int is safe from any context)
     nonisolated static let defaultMaxSectors = 8
@@ -337,6 +501,18 @@ class PortfolioStore {
         apiKeyProvider() != nil
     }
 
+    /// The current Claude API key, for requests made outside this file.
+    var claudeAPIKey: String? {
+        apiKeyProvider()
+    }
+
+    /// The step a running market analysis is on, or nil when none is running. Not persisted.
+    var marketAnalysisPhase: MarketAnalysisPhase?
+    /// What Claude has done so far in the current (or last) market analysis, oldest first. Not persisted.
+    var marketAnalysisActivity: [AnalysisActivity] = []
+    /// Whether iOS let the running analysis continue in the background; nil when none is running.
+    var marketAnalysisBackground: MarketAnalysisBackground?
+
     init(
         defaults: UserDefaults = .standard,
         http: any HTTPClient = URLSession.shared,
@@ -347,6 +523,7 @@ class PortfolioStore {
         self.apiKeyProvider = apiKeyProvider
         resetDataIfNeeded()
         loadFromUserDefaults()
+        loadPriceCache()
         loadTickerOverrides()
         ensureCashInvestmentExists()
         debugPrintInvestments()
@@ -419,6 +596,21 @@ class PortfolioStore {
             return
         }
         investments = decoded
+    }
+
+    /// Restores the last exchange rates and refresh time, so values are right in GBP before the first refresh.
+    /// (Prices themselves are saved with each investment.)
+    private func loadPriceCache() {
+        if let saved = defaults.dictionary(forKey: exchangeRatesKey) as? [String: Double] {
+            // The fixed GBP/GBX rates always win over anything saved
+            exchangeRates = saved.merging(exchangeRates) { _, fixed in fixed }
+        }
+        lastPriceRefresh = defaults.object(forKey: lastPriceRefreshKey) as? Date
+    }
+
+    private func savePriceCache() {
+        defaults.set(exchangeRates, forKey: exchangeRatesKey)
+        defaults.set(lastPriceRefresh, forKey: lastPriceRefreshKey)
     }
 
     // MARK: - Reset
@@ -732,6 +924,12 @@ class PortfolioStore {
             }
 
             if !Task.isCancelled {
+                // Only counts as refreshed if at least one price came back (not when offline)
+                let symbolCount = investments.filter { $0.symbol != nil }.count
+                if symbolCount == 0 || failedIDs.count < symbolCount {
+                    lastPriceRefresh = Date()
+                }
+                savePriceCache()
                 logPortfolioAfterRefresh()
             }
 
