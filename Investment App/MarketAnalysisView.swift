@@ -21,6 +21,8 @@ struct MarketAnalysisView: View {
     @State private var errorMessage: String?
     @State private var showsHolds = false
     @State private var page = 0
+    /// Off by default: a run reuses today's research instead of searching the web again
+    @State private var searchesAgain = false
 
     private static var latestAnalysis: FetchDescriptor<AnalysisRecord> {
         var descriptor = FetchDescriptor<AnalysisRecord>(sortBy: [SortDescriptor(\.date, order: .reverse)])
@@ -87,6 +89,20 @@ struct MarketAnalysisView: View {
                 .disabled(isRunning)
                 .accessibilityIdentifier("analysis.instructions")
 
+            // Research is reused within the same day unless the user asks for a fresh web search
+            if !isRunning, let research = AnalysisRecord.todaysResearch(in: modelContext) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle("Search for new market news", isOn: $searchesAgain)
+                        .font(.subheadline)
+                        .accessibilityIdentifier("analysis.searchAgain")
+                    Text(searchesAgain
+                         ? "Claude will search the web again for the latest news."
+                         : "Today's research from \(research.date.formatted(date: .omitted, time: .shortened)) will be reused — no new web searches, so it costs less.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             Button(action: run) {
                 Label(latest.isEmpty ? "Run Analysis" : "Run New Analysis", systemImage: "sparkles")
                     .frame(maxWidth: .infinity)
@@ -98,7 +114,7 @@ struct MarketAnalysisView: View {
         }
     }
 
-    /// The current step and a live list of what Claude is doing, newest at the bottom.
+    /// The current step and a short list of the major steps so far, each updated in place.
     private func runningView(_ phase: MarketAnalysisPhase) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
@@ -106,49 +122,59 @@ struct MarketAnalysisView: View {
                 Text(phase.message)
                     .font(.headline)
             }
-            Text("A deep analysis can take a few minutes. You can close this screen or leave the app — you'll get a notification when it's ready.")
+            if case .unavailable(let reason) = store.marketAnalysisBackground {
+                Label {
+                    Text("Keep the app open until the analysis finishes — iOS won't let it run in the background this time. \(reason)")
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                }
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.orange)
+                .accessibilityIdentifier("analysis.foregroundOnly")
+            } else {
+                Text("A deep analysis can take a few minutes. You can close this screen or leave the app — you'll get a notification when it's ready.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
 
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 12) {
+            if !store.marketAnalysisActivity.isEmpty {
+                VStack(alignment: .leading, spacing: 14) {
                     ForEach(store.marketAnalysisActivity) { activity in
-                        activityRow(activity, isLatest: activity.id == store.marketAnalysisActivity.last?.id)
+                        activityRow(activity)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding()
+                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16))
+                .animation(.default, value: store.marketAnalysisActivity)
+                .accessibilityIdentifier("analysis.activity")
             }
-            // Follows new activity as it arrives
-            .defaultScrollAnchor(.bottom, for: .sizeChanges)
-            .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16))
-            .accessibilityIdentifier("analysis.activity")
         }
         .padding([.horizontal, .bottom])
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
-    private func activityRow(_ activity: AnalysisActivity, isLatest: Bool) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 10) {
+    private func activityRow(_ activity: AnalysisActivity) -> some View {
+        let iconColor: Color = switch activity.kind {
+        case .problem: .orange
+        case .done: .green
+        default: .accentColor
+        }
+        return HStack(alignment: .firstTextBaseline, spacing: 10) {
             Image(systemName: activity.kind.systemImage)
-                .foregroundStyle(activity.kind == .problem ? Color.orange : Color.accentColor)
+                .foregroundStyle(iconColor)
                 .frame(width: 20)
             VStack(alignment: .leading, spacing: 2) {
                 Text(activity.text)
-                    .font(activity.kind == .thinking ? .subheadline.italic() : .subheadline)
-                    .foregroundStyle(activity.kind == .thinking ? .secondary : .primary)
-                    // Long writing and thinking show their latest part
-                    .lineLimit(activity.kind == .writing || activity.kind == .thinking ? 3 : 2)
-                    .truncationMode(activity.kind == .writing || activity.kind == .thinking ? .head : .tail)
+                    .font(.subheadline)
                 if let detail = activity.detail {
                     Text(detail)
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                        .lineLimit(2)
                 }
             }
         }
-        .opacity(isLatest ? 1 : 0.75)
     }
 
     private func run() {
@@ -162,12 +188,14 @@ struct MarketAnalysisView: View {
             context: modelContext,
             instructions: instructions,
             termsExplainedToday: termsExplainedToday(),
-            feedback: AnalysisRecord.recentFeedback(in: modelContext)
+            feedback: AnalysisRecord.recentFeedback(in: modelContext),
+            earlierResearch: searchesAgain ? nil : AnalysisRecord.todaysResearch(in: modelContext)
         ) { result in
             switch result {
             case .success:
                 showsHolds = false
                 page = 0
+                searchesAgain = false
             case .failure(let failure):
                 errorMessage = failure.message
             }
@@ -234,9 +262,19 @@ struct MarketAnalysisView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Market Summary")
                     .font(.title3.bold())
-                Text(analysis.date, format: .dateTime.day().month().year().hour().minute())
+                Text("Analysed \(analysis.date.formatted(.dateTime.day().month(.wide).year())) at \(analysis.date.formatted(date: .omitted, time: .shortened))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if let researchDate = analysis.researchDate {
+                    Label(
+                        analysis.reusedResearch
+                            ? "Research from \(researchDate.formatted(date: .omitted, time: .shortened)) (reused from an earlier analysis)"
+                            : "Research done at the same time",
+                        systemImage: analysis.reusedResearch ? "arrow.triangle.2.circlepath" : "magnifyingglass"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
             }
 
             MarkdownText(analysis.summary)

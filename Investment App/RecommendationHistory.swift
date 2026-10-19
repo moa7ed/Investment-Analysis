@@ -25,6 +25,10 @@ final class AnalysisRecord {
     /// The user's like/dislike of the summary ("like" / "dislike"), sent with later analyses
     var summaryRatingRawValue: String?
     var summaryComment: String?
+    /// The web research behind this analysis, kept so later runs the same day can reuse it (nil for older records)
+    var researchNotes: String?
+    /// When that research was done — earlier than `date` when it was reused from an earlier run
+    var researchDate: Date?
 
     init(
         date: Date,
@@ -57,6 +61,31 @@ final class AnalysisRecord {
             portfolioValueGBP: analysis.portfolioValueGBP,
             recommendations: analysis.recommendations.enumerated().map { RecommendationRecord($1, date: analysis.date, order: $0) }
         )
+        researchNotes = analysis.researchNotes
+        researchDate = analysis.researchDate
+    }
+
+    /// True when this analysis reused research from an earlier run instead of searching the web itself.
+    var reusedResearch: Bool {
+        guard let researchDate else { return false }
+        return date.timeIntervalSince(researchDate) > 60
+    }
+
+    /// The most recent research done today, for a new run to reuse instead of searching the web again.
+    static func todaysResearch(in context: ModelContext) -> EarlierResearch? {
+        let startOfDay = Calendar.current.startOfDay(for: .now)
+        var descriptor = FetchDescriptor<AnalysisRecord>(
+            predicate: #Predicate { $0.date >= startOfDay },
+            sortBy: [SortDescriptor(\.date, order: .reverse)]
+        )
+        descriptor.fetchLimit = 10
+        let records = (try? context.fetch(descriptor)) ?? []
+        guard let record = records.first(where: { $0.researchNotes?.isEmpty == false }),
+              let notes = record.researchNotes,
+              let researchDate = record.researchDate,
+              Calendar.current.isDateInToday(researchDate)
+        else { return nil }
+        return EarlierResearch(notes: notes, sources: record.sources, date: researchDate)
     }
 
     /// Recommendations in the order Claude gave them (SwiftData doesn't keep relationship order).

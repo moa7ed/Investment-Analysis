@@ -7,24 +7,70 @@
 
 import Foundation
 import Observation
+import OSLog
 
 // MARK: - Claude API
 
 /// Why a Claude request produced no usable result.
-enum ClaudeFailure: Error {
+enum ClaudeFailure: Error, Equatable {
     case missingKey
     /// Claude's safety filters declined the request (`stop_reason: "refusal"`).
     case refused
     /// Network, HTTP, or decoding failure.
     case failed
+    /// The API returned an error (HTTP status, or 200 with an error event mid-stream), with its message.
+    case api(status: Int, message: String)
+    /// The request didn't reach the API or the connection dropped.
+    case network(String)
+    /// Claude replied, but the reply couldn't be used (cut off, wrong format, empty), with the reason.
+    case invalidResponse(String)
+    /// A failure in one step of a multi-step task (e.g. "Researching the market").
+    indirect case during(step: String, ClaudeFailure)
+    /// iOS stopped the work, or never allowed it to run in the background; the message says which.
+    case backgroundStopped(String)
+
+    /// The connection was cancelled or dropped (rather than Claude or the API reporting a problem).
+    var isConnectionFailure: Bool {
+        switch self {
+        case .network: true
+        case .during(_, let failure): failure.isConnectionFailure
+        default: false
+        }
+    }
 
     var message: String {
         switch self {
         case .missingKey: "Add your Claude API key in Settings."
         case .refused: "Claude declined to process this request."
         case .failed: "The request to Claude failed. Check your connection and try again."
+        case .api(let status, let message):
+            switch status {
+            case 401: "Claude rejected the API key. Check it in Settings. (\(message))"
+            case 429: "Claude's rate limit was reached. Wait a minute and try again. (\(message))"
+            case 529: "Claude is overloaded right now. Try again in a few minutes. (\(message))"
+            default: "Claude API error (\(status)): \(message)"
+            }
+        case .network(let description): "Couldn't reach Claude: \(description)"
+        case .invalidResponse(let reason): reason
+        case .during(let step, let failure): "\(step) failed. \(failure.message)"
+        case .backgroundStopped(let reason): reason
         }
     }
+
+    /// Reads the message from an API error body (`{"type": "error", "error": {"type", "message"}}`).
+    static func apiError(status: Int, body: Data) -> ClaudeFailure {
+        let error = (try? JSONSerialization.jsonObject(with: body) as? [String: Any])?["error"] as? [String: Any]
+        let message = error?["message"] as? String
+            ?? String(data: body, encoding: .utf8).map { String($0.prefix(300)) }
+            ?? "no details"
+        return .api(status: status, message: message)
+    }
+}
+
+/// Claude request failures go to the system log (visible in Console.app and Xcode, even when the app
+/// wasn't launched from Xcode), filterable by the "Claude" category.
+enum ClaudeLog {
+    static let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "Investment-App", category: "Claude")
 }
 
 enum ClaudeAPI {
@@ -159,7 +205,7 @@ enum ClaudeAPI {
         // Every block Claude has produced so far, resent as one assistant turn when continuing a pause
         var assistantContent: [[String: Any]] = []
 
-        for _ in 0...maxContinuations {
+        for attempt in 0...maxContinuations {
             var messages = [userMessage]
             if !assistantContent.isEmpty {
                 messages.append(["role": "assistant", "content": echoableContent(assistantContent)])
@@ -168,6 +214,10 @@ enum ClaudeAPI {
                 "model": model,
                 "max_tokens": maxTokens,
                 "thinking": summarizedThinking,
+                // Gathering news needs less reasoning than the analysis itself, which stays at the default (high)
+                "output_config": ["effort": "medium"],
+                // Caches the conversation so far: resuming a paused turn re-reads it at the cached-input price
+                "cache_control": ["type": "ephemeral"],
                 "tools": tools,
                 "messages": messages
             ]
@@ -175,9 +225,12 @@ enum ClaudeAPI {
             let reply: StreamedMessage
             switch await streamMessage(body: body, apiKey: apiKey, timeout: 300, allowFallback: true, http: http, onEvent: onEvent) {
             case .success(let value): reply = value
-            case .failure(let failure): return .failure(failure)
+            case .failure(let failure):
+                ClaudeLog.logger.error("Research request \(attempt + 1, privacy: .public) failed: \(failure.message, privacy: .public)")
+                return .failure(failure)
             }
 
+            ClaudeLog.logger.info("Research request \(attempt + 1, privacy: .public) finished: stop_reason=\(reply.stopReason ?? "none", privacy: .public), \(reply.content.count, privacy: .public) blocks")
             assistantContent += reply.content
             switch reply.stopReason {
             case "pause_turn":
@@ -189,7 +242,7 @@ enum ClaudeAPI {
                 return research(from: assistantContent)
             }
         }
-        print("[ClaudeAPI] Research still paused after \(maxContinuations) continuations; using notes so far")
+        ClaudeLog.logger.notice("Research still paused after \(maxContinuations, privacy: .public) continuations; using notes so far")
         return research(from: assistantContent)
     }
 
@@ -202,7 +255,9 @@ enum ClaudeAPI {
 
         let notes = textBlocks.compactMap { $0["text"] as? String }.joined()
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !notes.isEmpty else { return .failure(.failed) }
+        guard !notes.isEmpty else {
+            return .failure(.invalidResponse("Claude finished researching without writing any notes."))
+        }
 
         var seen = Set<String>()
         let sources = textBlocks
@@ -455,6 +510,8 @@ class PortfolioStore {
     var marketAnalysisPhase: MarketAnalysisPhase?
     /// What Claude has done so far in the current (or last) market analysis, oldest first. Not persisted.
     var marketAnalysisActivity: [AnalysisActivity] = []
+    /// Whether iOS let the running analysis continue in the background; nil when none is running.
+    var marketAnalysisBackground: MarketAnalysisBackground?
 
     init(
         defaults: UserDefaults = .standard,

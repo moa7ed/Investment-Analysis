@@ -84,9 +84,11 @@ struct MarketAnalysisTests {
         let prompt = try #require(http.claudePrompts.last)
         #expect(prompt.contains("1. Apple (AAPL)"))
         #expect(prompt.contains("2. Tesla (TSLA)"))
-        #expect(prompt.contains("Trading 212 ISA: 3 units"))
-        #expect(prompt.contains("Revolut Invest: 1 units"))
-        #expect(prompt.contains("Target: 20.00%"))
+        #expect(prompt.contains("Trading 212 ISA 3 (£300)"))
+        #expect(prompt.contains("Revolut Invest 1 (£100)"))
+        #expect(prompt.contains("57.14% → 20.00%"))
+        #expect(!prompt.contains("Sources consulted"), "Sources aren't sent twice")
+        #expect(prompt.contains("reason for a hold: one short bullet"))
         #expect(prompt.contains("Uninvested cash:"))
         #expect(!prompt.contains("3. Cash"), "Cash isn't rated")
         #expect(prompt.contains("Capital Gains Tax"))
@@ -178,7 +180,8 @@ struct MarketAnalysisTests {
             return AnalysisRecord(MarketAnalysis(
                 date: date, summary: summary,
                 recommendations: [.init(investment: snapshot, action: .buy, reason: "Strong iPhone sales.")],
-                explainedTerms: [], sources: [], userInstructions: nil, portfolioValueGBP: 800
+                explainedTerms: [], sources: [], userInstructions: nil, portfolioValueGBP: 800,
+                researchNotes: "Notes", researchDate: date
             ))
         }
         let older = record(daysAgo: 2, summary: "Old summary")
@@ -220,6 +223,37 @@ struct MarketAnalysisTests {
         #expect(prompt.contains("isn't an instruction to reverse a call"))
     }
 
+    @Test("Today's earlier research is reused without searching, and Claude is told when it was gathered")
+    func reusesEarlierResearch() async throws {
+        let http = StubHTTPClient()
+        stubAnalysis(http, recommendations: [])
+        let earlier = EarlierResearch(
+            notes: "Apple fell 3% (Reuters, 18 Oct).", sources: [AnalysisSource(title: "Reuters", url: "https://reuters.com/a")],
+            date: Date(timeIntervalSinceNow: -3 * 3600)
+        )
+
+        let analysis = try await makePortfolio(http: http).analyseMarket(additionalInstructions: "", earlierResearch: earlier).get()
+        #expect(http.claudeRequests.count == 1, "Only the analysis request; no web research")
+        let prompt = try #require(http.claudePrompts.last)
+        #expect(prompt.contains("Apple fell 3%"))
+        #expect(prompt.contains("earlier today at \(earlier.date.formatted(date: .omitted, time: .shortened)) and not refreshed"))
+        #expect(analysis.researchDate == earlier.date)
+        #expect(analysis.sources == earlier.sources)
+    }
+
+    @Test("Research requests use medium effort and prompt caching; the analysis request doesn't")
+    func researchRequestSettings() async throws {
+        let http = StubHTTPClient()
+        stubAnalysis(http, recommendations: [])
+        _ = await makePortfolio(http: http).analyseMarket(additionalInstructions: "")
+
+        let research = try body(of: http.claudeRequests[0])
+        #expect((research["output_config"] as? [String: Any])?["effort"] as? String == "medium")
+        #expect((research["cache_control"] as? [String: Any])?["type"] as? String == "ephemeral")
+        let analysis = try body(of: http.claudeRequests[1])
+        #expect((analysis["output_config"] as? [String: Any])?["effort"] == nil)
+    }
+
     @Test("A real event stream is rebuilt into notes and shown as live activity")
     func streamsActivity() async throws {
         let http = StubHTTPClient()
@@ -258,15 +292,12 @@ struct MarketAnalysisTests {
         let analystPrompt = try #require(http.claudePrompts.last)
         #expect(analystPrompt.contains("Apple beat estimates."))
 
+        // Only the major steps: research (with counts) marked done, then writing; no thinking or streamed text
         let activity = store.marketAnalysisActivity
-        #expect(activity.map(\.kind) == [.thinking, .searching, .results, .writing, .writing])
-        #expect(activity[1].text == "Searching: Apple earnings")
-        #expect(activity[2].text == "Found 1 result")
-        #expect(activity[2].detail == "reuters.com")
-        // The two cited text blocks run together into one row
-        #expect(activity[3].text == "Apple beat estimates.")
-        // The analysis step's JSON is summarised, not shown raw
-        #expect(activity[4].text.hasPrefix("Writing"))
+        #expect(activity.map(\.kind) == [.done, .writing])
+        #expect(activity[0].text == "Researched the market")
+        #expect(activity[0].detail == "1 search · 1 site")
+        #expect(activity[1].text.hasPrefix("Writing"))
     }
 
     @Test("A stream that ends before message_stop fails")
@@ -275,7 +306,67 @@ struct MarketAnalysisTests {
         let partial = "data: {\"type\":\"message_start\",\"message\":{\"content\":[]}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"Half\"}}"
         http.on { _ in (200, Data(partial.utf8)) }
         let result = await makePortfolio(http: http).analyseMarket(additionalInstructions: "")
-        #expect(throws: ClaudeFailure.failed) { try result.get() }
+        #expect(throws: ClaudeFailure.during(
+            step: "Researching the market", .network("The connection closed before Claude finished replying.")
+        )) { try result.get() }
+    }
+
+    @Test("Failures say which step failed and why", arguments: [
+        (400, #"{"type":"error","error":{"type":"invalid_request_error","message":"web search is not enabled"}}"#,
+         "Researching the market failed. Claude API error (400): web search is not enabled"),
+        (529, #"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+         "Researching the market failed. Claude is overloaded right now. Try again in a few minutes. (Overloaded)")
+    ])
+    func failureMessages(status: Int, body: String, expected: String) async throws {
+        let http = StubHTTPClient()
+        http.on { _ in (status, Data(body.utf8)) }
+        let result = await makePortfolio(http: http).analyseMarket(additionalInstructions: "")
+        guard case .failure(let failure) = result else {
+            Issue.record("Expected a failure")
+            return
+        }
+        #expect(failure.message == expected)
+    }
+
+    @Test("An analysis reply in the wrong format names the problem")
+    func malformedAnalysis() async throws {
+        let http = StubHTTPClient()
+        http.claude { prompt in
+            if prompt.contains("Research the latest market news") { return .json("Notes.") }
+            if prompt.contains("Act as an experienced financial analyst") {
+                return .json(#"{"summary": "Hi", "recommendations": [{"investment": 1, "recommendation": "buy"}], "explainedTerms": []}"#)
+            }
+            return nil
+        }
+        let result = await makePortfolio(http: http).analyseMarket(additionalInstructions: "")
+        guard case .failure(let failure) = result else {
+            Issue.record("Expected a failure")
+            return
+        }
+        #expect(failure.message.hasPrefix("Writing recommendations failed."))
+        #expect(failure.message.contains("missing field 'reason' in recommendations[0]"))
+    }
+
+    @Test("The prompt pins down the response format, including the exact number of recommendations")
+    func responseFormatInPrompt() async throws {
+        let http = StubHTTPClient()
+        stubAnalysis(http, recommendations: [])
+        _ = await makePortfolio(http: http).analyseMarket(additionalInstructions: "Be brief")
+
+        let prompt = try #require(http.claudePrompts.last)
+        #expect(prompt.contains("must be a single JSON object with exactly these three fields"))
+        #expect(prompt.contains("exactly 2 items, one for each numbered investment"))
+        #expect(prompt.contains(#"exactly "buy", "sell" or "hold", in lowercase"#))
+        // The reminder comes after the user's notes
+        let notes = try #require(prompt.range(of: "Additional instructions from me: Be brief"))
+        let reminder = try #require(prompt.range(of: "Reply with the JSON object only"))
+        #expect(notes.upperBound <= reminder.lowerBound)
+
+        let body = try body(of: try #require(http.claudeRequests.last))
+        let schema = (body["output_config"] as? [String: Any])?["format"] as? [String: Any]
+        let properties = ((schema?["schema"] as? [String: Any])?["properties"] as? [String: Any]) ?? [:]
+        let recommendations = properties["recommendations"] as? [String: Any]
+        #expect((recommendations?["description"] as? String)?.contains("1 to 2") == true)
     }
 
     @Test("A failed research step stops before the analysis request")
@@ -283,7 +374,7 @@ struct MarketAnalysisTests {
         let http = StubHTTPClient()
         http.claude { _ in .refusal }
         let result = await makePortfolio(http: http).analyseMarket(additionalInstructions: "")
-        #expect(throws: ClaudeFailure.refused) { try result.get() }
+        #expect(throws: ClaudeFailure.during(step: "Researching the market", .refused)) { try result.get() }
         #expect(http.claudeRequests.count == 1)
     }
 

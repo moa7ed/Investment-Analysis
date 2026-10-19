@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import OSLog
 
 /// Something Claude did mid-response, reported while a streamed request runs.
 /// `id` identifies the content block, so later events for the same block update it.
@@ -38,18 +39,32 @@ struct MessageStreamAccumulator {
     private(set) var content: [[String: Any]] = []
     private(set) var stopReason: String?
     private(set) var errorMessage: String?
+    /// e.g. "overloaded_error", from a mid-stream `error` event
+    private(set) var errorType: String?
     /// Set by `message_stop`; a stream that ends without it was cut off
     private(set) var isComplete = false
     /// A stable ID per block index, for progress events
     private(set) var blockIDs: [Int: UUID] = [:]
     /// Tool input arrives as JSON fragments, parsed when the block stops
     private var partialJSON: [Int: String] = [:]
+    /// Token and search counts: `message_start` has the input side, `message_delta` the final totals
+    private(set) var usage: [String: Any] = [:]
+
+    /// One log-friendly line, e.g. "input 12034, cache write 0, cache read 48210, output 3120, searches 14".
+    var usageSummary: String {
+        func count(_ key: String) -> Int { usage[key] as? Int ?? 0 }
+        let searches = (usage["server_tool_use"] as? [String: Any])?["web_search_requests"] as? Int ?? 0
+        return "input \(count("input_tokens")), cache write \(count("cache_creation_input_tokens")), "
+            + "cache read \(count("cache_read_input_tokens")), output \(count("output_tokens")), searches \(searches)"
+    }
 
     /// Applies one event's JSON; returns the block it changed, if any.
     mutating func apply(_ event: [String: Any]) -> Change? {
         switch event["type"] as? String {
         case "message_start":
-            content = (event["message"] as? [String: Any])?["content"] as? [[String: Any]] ?? []
+            let message = event["message"] as? [String: Any]
+            content = message?["content"] as? [[String: Any]] ?? []
+            usage = message?["usage"] as? [String: Any] ?? [:]
             return nil
 
         case "content_block_start":
@@ -96,6 +111,10 @@ struct MessageStreamAccumulator {
             if let reason = (event["delta"] as? [String: Any])?["stop_reason"] as? String {
                 stopReason = reason
             }
+            // The final usage is cumulative; it replaces the counts from message_start
+            if let finalUsage = event["usage"] as? [String: Any] {
+                usage.merge(finalUsage) { _, new in new }
+            }
             return nil
 
         case "message_stop":
@@ -104,7 +123,8 @@ struct MessageStreamAccumulator {
 
         case "error":
             let error = event["error"] as? [String: Any]
-            errorMessage = "\(error?["type"] as? String ?? "error"): \(error?["message"] as? String ?? "unknown")"
+            errorType = error?["type"] as? String
+            errorMessage = error?["message"] as? String ?? "unknown error"
             return nil
 
         default:
@@ -171,20 +191,24 @@ extension ClaudeAPI {
         body["stream"] = true
         // For a stream the timeout is the longest wait between bytes, not for the whole reply
         guard let request = makeRequest(body: body, apiKey: apiKey, timeout: timeout, allowFallback: allowFallback) else {
-            return .failure(.failed)
+            ClaudeLog.logger.error("Couldn't encode the request body")
+            return .failure(.invalidResponse("The app couldn't build the request to Claude."))
         }
 
         var accumulator = MessageStreamAccumulator()
         do {
             let (lines, response) = try await http.lines(for: request)
-            guard let httpResponse = response as? HTTPURLResponse else { return .failure(.failed) }
+            guard let httpResponse = response as? HTTPURLResponse else {
+                return .failure(.network("The server's response wasn't an HTTP response."))
+            }
             guard httpResponse.statusCode == 200 else {
-                var errorBody = ""
+                var errorLines: [String] = []
                 for try await line in lines {
-                    errorBody += line
+                    errorLines.append(line)
                 }
-                print("[ClaudeAPI] Stream HTTP \(httpResponse.statusCode): \(errorBody)")
-                return .failure(.failed)
+                let errorBody = errorLines.joined(separator: "\n")
+                ClaudeLog.logger.error("HTTP \(httpResponse.statusCode, privacy: .public): \(errorBody, privacy: .public)")
+                return .failure(ClaudeFailure.apiError(status: httpResponse.statusCode, body: Data(errorBody.utf8)))
             }
 
             for try await line in lines {
@@ -196,18 +220,33 @@ extension ClaudeAPI {
                 }
             }
         } catch {
-            print("[ClaudeAPI] Stream error: \(error)")
-            return .failure(.failed)
+            ClaudeLog.logger.error("Stream failed after \(accumulator.content.count, privacy: .public) blocks: \(String(describing: error), privacy: .public)")
+            if Task.isCancelled || (error as? URLError)?.code == .cancelled {
+                return .failure(.network("The request was cancelled before Claude finished."))
+            }
+            return .failure(.network(error.localizedDescription))
         }
 
         if let errorMessage = accumulator.errorMessage {
-            print("[ClaudeAPI] Stream error event: \(errorMessage)")
-            return .failure(.failed)
+            ClaudeLog.logger.error("Stream error event \(accumulator.errorType ?? "unknown", privacy: .public): \(errorMessage, privacy: .public)")
+            // Errors after the stream opened arrive as events; map their type to the matching HTTP status
+            let status = switch accumulator.errorType {
+            case "overloaded_error": 529
+            case "rate_limit_error": 429
+            case "invalid_request_error": 400
+            default: 500
+            }
+            return .failure(.api(status: status, message: errorMessage))
         }
-        guard accumulator.isComplete, !Task.isCancelled else {
-            print("[ClaudeAPI] Stream ended before the reply was complete")
-            return .failure(.failed)
+        guard !Task.isCancelled else {
+            ClaudeLog.logger.notice("Stream cancelled")
+            return .failure(.network("The request was cancelled before Claude finished."))
         }
+        guard accumulator.isComplete else {
+            ClaudeLog.logger.error("Stream closed before message_stop, after \(accumulator.content.count, privacy: .public) blocks")
+            return .failure(.network("The connection closed before Claude finished replying."))
+        }
+        ClaudeLog.logger.info("Usage: \(accumulator.usageSummary, privacy: .public), stop_reason=\(accumulator.stopReason ?? "none", privacy: .public)")
         return .success(StreamedMessage(content: accumulator.content, stopReason: accumulator.stopReason))
     }
 
@@ -238,23 +277,49 @@ extension ClaudeAPI {
 
         switch message.stopReason {
         case "refusal":
+            ClaudeLog.logger.error("Structured reply refused")
             return .failure(.refused)
         case "max_tokens":
-            print("[ClaudeAPI] Streamed response truncated at max_tokens (\(maxTokens))")
-            return .failure(.failed)
+            ClaudeLog.logger.error("Structured reply cut off at max_tokens (\(maxTokens, privacy: .public))")
+            return .failure(.invalidResponse(
+                "Claude's reply was cut off because it reached the length limit (\(maxTokens.formatted()) tokens)."
+            ))
         default:
             break
         }
 
         // The last text block is the answer (after a fallback, earlier blocks are the declined model's partial output)
         guard let text = message.content.last(where: { $0["type"] as? String == "text" })?["text"] as? String else {
-            return .failure(.failed)
+            let types = message.content.compactMap { $0["type"] as? String }.joined(separator: ", ")
+            ClaudeLog.logger.error("Structured reply had no text block; blocks: [\(types, privacy: .public)], stop_reason=\(message.stopReason ?? "none", privacy: .public)")
+            return .failure(.invalidResponse("Claude's reply contained no answer text."))
         }
         do {
             return .success(try JSONDecoder().decode(T.self, from: Data(text.utf8)))
         } catch {
-            print("[ClaudeAPI] Decode error: \(error)\nRaw response: \(text)")
-            return .failure(.failed)
+            ClaudeLog.logger.error("Structured reply didn't decode: \(String(describing: error), privacy: .public)\nRaw reply: \(text, privacy: .public)")
+            return .failure(.invalidResponse("Claude's reply wasn't in the expected format (\(describe(error)))."))
+        }
+    }
+
+    /// A short, readable reason for a JSON decoding failure, e.g. "missing field 'reason' in recommendations[3]".
+    private static func describe(_ error: Error) -> String {
+        func path(_ codingPath: [CodingKey]) -> String {
+            codingPath.map { key in key.intValue.map { "[\($0)]" } ?? ".\(key.stringValue)" }
+                .joined()
+                .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        }
+        switch error as? DecodingError {
+        case .keyNotFound(let key, let context)?:
+            let location = path(context.codingPath)
+            return "missing field '\(key.stringValue)'" + (location.isEmpty ? "" : " in \(location)")
+        case .typeMismatch(_, let context)?, .valueNotFound(_, let context)?:
+            return "unexpected value at \(path(context.codingPath))"
+        case .dataCorrupted(let context)?:
+            let location = path(context.codingPath)
+            return location.isEmpty ? "not valid JSON" : "invalid value at \(location)"
+        default:
+            return error.localizedDescription
         }
     }
 

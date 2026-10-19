@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import OSLog
 
 /// The step a market analysis is on, shown while it runs.
 enum MarketAnalysisPhase {
@@ -22,18 +23,29 @@ enum MarketAnalysisPhase {
     }
 }
 
-/// One line in the live activity list shown while an analysis runs.
+/// Whether iOS agreed to keep a running analysis going if the app leaves the screen.
+enum MarketAnalysisBackground: Equatable {
+    case allowed
+    /// With iOS's reason, in plain words
+    case unavailable(String)
+}
+
+/// One line in the live activity list shown while an analysis runs — one per major step, updated in place.
 struct AnalysisActivity: Identifiable, Equatable {
     enum Kind {
-        case thinking, searching, filtering, results, writing, problem
+        /// Researching the market (web searches)
+        case searching
+        /// Writing the market summary and recommendations
+        case writing
+        /// A finished step
+        case done
+        case problem
 
         var systemImage: String {
             switch self {
-            case .thinking: "brain"
             case .searching: "magnifyingglass"
-            case .filtering: "line.3.horizontal.decrease"
-            case .results: "doc.text.magnifyingglass"
             case .writing: "pencil"
+            case .done: "checkmark.circle.fill"
             case .problem: "exclamationmark.triangle"
             }
         }
@@ -45,90 +57,138 @@ struct AnalysisActivity: Identifiable, Equatable {
     var detail: String?
 }
 
-/// Turns stream events into activity rows on the store: one row per search, result and thought,
-/// with consecutive text blocks (citations split Claude's writing into many) merged into one row.
+/// Turns stream events into a short list of major steps on the store: one research row (search and site
+/// counts plus the current search), one writing row, and a row per kind of problem. Claude's thinking and
+/// the text it streams aren't shown.
 @MainActor
 private final class AnalysisActivityRecorder {
     private let store: PortfolioStore
-    /// Advanced once per web search, for the system's background progress UI
-    private let searchProgress: Progress?
-    private var phase = MarketAnalysisPhase.researching
-    /// The row being written to, and the text of earlier blocks already in it
-    private var writing: (rowID: UUID, blockID: UUID, earlierText: String, blockText: String)?
-    /// Rows keep at most this much of Claude's writing; the view shows the latest part
-    private static let maxRowText = 400
+    /// The current step's progress (research, then writing), for the system's background progress UI
+    private var stepProgress: Progress?
+    /// Units in each step's progress; fine-grained so small, steady advances are possible
+    static let stepUnits: Int64 = 10_000
+    /// A step never reports more than this until it really finishes
+    private static let stepCap: Int64 = 9_500
 
-    init(store: PortfolioStore, searchProgress: Progress?) {
+    private let researchRowID = UUID()
+    private let writingRowID = UUID()
+    private var searchCount = 0
+    private var sites = Set<String>()
+    private var latestQuery: String?
+    /// True when today's earlier research is reused, so the research row keeps saying so
+    private var researchReused = false
+    /// Problem rows by message, so a repeated problem (e.g. every search over the limit) shows once
+    private var problemRowIDs: [String: UUID] = [:]
+
+    init(store: PortfolioStore, stepProgress: Progress?) {
         self.store = store
-        self.searchProgress = searchProgress
+        self.stepProgress = stepProgress
+        updateResearchRow(done: false)
     }
 
-    func begin(_ phase: MarketAnalysisPhase) {
-        self.phase = phase
-        writing = nil
+    /// Shows that today's earlier research is being used instead of a new web search.
+    func reuseResearch(from date: Date) {
+        researchReused = true
+        upsert(AnalysisActivity(
+            id: researchRowID,
+            kind: .done,
+            text: "Using today's research from \(date.formatted(date: .omitted, time: .shortened))",
+            detail: "No new web searches this time"
+        ))
+    }
+
+    /// Marks research done (unless it was reused) and starts the writing step.
+    func beginWriting(stepProgress: Progress?) {
+        self.stepProgress = stepProgress
+        if !researchReused {
+            updateResearchRow(done: true)
+        }
+        upsert(AnalysisActivity(id: writingRowID, kind: .writing, text: "Writing the market summary"))
+    }
+
+    /// Moves progress a little every few seconds while the analysis runs. Searches run on Anthropic's servers and
+    /// can leave the stream silent for a while; without this the background task would look stuck to iOS.
+    private var heartbeat: Task<Void, Never>?
+
+    func startHeartbeat() {
+        heartbeat = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(3))
+                self?.advanceProgress(fraction: 0.002)
+            }
+        }
+    }
+
+    func stopHeartbeat() {
+        heartbeat?.cancel()
+        heartbeat = nil
+    }
+
+    /// Moves the step's progress a fraction of the way to the cap. Each advance is smaller than the last,
+    /// so the bar keeps moving however long the step takes, without reaching the end before it's done.
+    private func advanceProgress(fraction: Double) {
+        guard let stepProgress else { return }
+        let remaining = Self.stepCap - stepProgress.completedUnitCount
+        guard remaining > 0 else { return }
+        stepProgress.completedUnitCount += max(1, Int64(Double(remaining) * fraction))
     }
 
     func record(_ event: ClaudeStreamEvent) {
-        switch event {
-        case .text(let blockID, let text):
-            recordWriting(blockID: blockID, text: text)
-            return
-        case .thinking(let id, let text):
-            let summary = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !summary.isEmpty else { return }
-            upsert(AnalysisActivity(id: id, kind: .thinking, text: String(summary.suffix(Self.maxRowText))))
-        case .toolUse(let id, let name, let input):
-            if name == "web_search" {
-                upsert(AnalysisActivity(id: id, kind: .searching, text: "Searching: \(input["query"] as? String ?? "the web")"))
-                if let searchProgress, searchProgress.completedUnitCount < searchProgress.totalUnitCount {
-                    searchProgress.completedUnitCount += 1
-                }
-            } else if store.marketAnalysisActivity.last?.kind != .filtering {
-                // Searches run inside a code sandbox that filters their results
-                upsert(AnalysisActivity(id: id, kind: .filtering, text: "Filtering search results"))
-            }
-        case .searchResults(let id, let results, let errorCode):
-            if let errorCode {
-                let text = errorCode == "max_uses_exceeded" ? "Reached the search limit" : "A search failed (\(errorCode))"
-                upsert(AnalysisActivity(id: id, kind: .problem, text: text))
-            } else {
-                var seen = Set<String>()
-                let sites = results
-                    .compactMap { URL(string: $0.url)?.host()?.replacingOccurrences(of: "www.", with: "") }
-                    .filter { seen.insert($0).inserted }
-                upsert(AnalysisActivity(
-                    id: id,
-                    kind: .results,
-                    text: "Found \(results.count) result\(results.count == 1 ? "" : "s")",
-                    detail: sites.isEmpty ? nil : sites.prefix(4).joined(separator: ", ")
-                ))
-            }
+        // Every event shows the work is moving; searches count for much more
+        if case .toolUse(_, "web_search", _) = event {
+            advanceProgress(fraction: 0.05)
+        } else {
+            advanceProgress(fraction: 0.0005)
         }
-        writing = nil
+
+        switch event {
+        case .toolUse(_, let name, let input) where name == "web_search":
+            searchCount += 1
+            latestQuery = input["query"] as? String
+            updateResearchRow(done: false)
+
+        case .searchResults(_, let results, let errorCode):
+            if let errorCode {
+                recordProblem(errorCode == "max_uses_exceeded" ? "Reached the search limit" : "A search failed (\(errorCode))")
+            } else {
+                sites.formUnion(results.compactMap { URL(string: $0.url)?.host()?.replacingOccurrences(of: "www.", with: "") })
+                updateResearchRow(done: false)
+            }
+
+        case .text(_, let text) where store.marketAnalysisPhase == .analysing:
+            // The reply is JSON, so show how far through the recommendations Claude is instead of the text
+            let count = text.components(separatedBy: "\"recommendation\"").count - 1
+            upsert(AnalysisActivity(
+                id: writingRowID,
+                kind: .writing,
+                text: count > 0 ? "Writing recommendations (\(count) so far)" : "Writing the market summary"
+            ))
+
+        default:
+            // Thinking, research notes as they're written, and result filtering aren't shown
+            break
+        }
     }
 
-    private func recordWriting(blockID: UUID, text: String) {
-        if phase == .analysing {
-            // The reply is JSON, so show how far through the recommendations Claude is instead of the raw text
-            let count = text.components(separatedBy: "\"recommendation\"").count - 1
-            let status = count > 0 ? "Writing recommendations (\(count) so far)" : "Writing the market summary"
-            let rowID = writing?.rowID ?? UUID()
-            writing = (rowID, blockID, "", text)
-            upsert(AnalysisActivity(id: rowID, kind: .writing, text: status))
-            return
+    private func updateResearchRow(done: Bool) {
+        let counts = searchCount == 0
+            ? nil
+            : "\(searchCount) search\(searchCount == 1 ? "" : "es") · \(sites.count) site\(sites.count == 1 ? "" : "s")"
+        if done {
+            upsert(AnalysisActivity(id: researchRowID, kind: .done, text: "Researched the market", detail: counts))
+        } else {
+            let detail = [counts, latestQuery.map { "Now: \($0)" }].compactMap { $0 }.joined(separator: "\n")
+            upsert(AnalysisActivity(
+                id: researchRowID, kind: .searching, text: "Researching the market", detail: detail.isEmpty ? nil : detail
+            ))
         }
+    }
 
-        var row = writing ?? (rowID: UUID(), blockID: blockID, earlierText: "", blockText: "")
-        if row.blockID != blockID {
-            // A new block straight after the last one continues the same row
-            row = (row.rowID, blockID, row.earlierText + row.blockText, "")
-        }
-        row.blockText = text
-        writing = row
-
-        let full = (row.earlierText + row.blockText).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !full.isEmpty else { return }
-        upsert(AnalysisActivity(id: row.rowID, kind: .writing, text: String(full.suffix(Self.maxRowText))))
+    private func recordProblem(_ message: String) {
+        guard problemRowIDs[message] == nil else { return }
+        let id = UUID()
+        problemRowIDs[message] = id
+        upsert(AnalysisActivity(id: id, kind: .problem, text: message))
     }
 
     private func upsert(_ activity: AnalysisActivity) {
@@ -180,11 +240,23 @@ struct MarketAnalysis {
     let sources: [AnalysisSource]
     let userInstructions: String?
     let portfolioValueGBP: Double
+    /// The web research the recommendations were based on, saved so later runs the same day can reuse it
+    let researchNotes: String
+    /// When that research was done; earlier than `date` when it was reused from an earlier run
+    let researchDate: Date
+}
+
+/// Research saved from an earlier run today, reused instead of searching the web again.
+struct EarlierResearch {
+    let notes: String
+    let sources: [AnalysisSource]
+    let date: Date
 }
 
 extension PortfolioStore {
-    /// Web searches allowed while researching; enough to cover a dozen or so holdings plus the macro picture.
-    private static let maxResearchSearches = 20
+    /// Web searches allowed per research request (the tool's `max_uses`); Claude is told this budget in the prompt.
+    /// At $10 per 1,000 searches, a full budget is about $0.50 plus the tokens for reading the results.
+    private static let maxResearchSearches = 50
 
     /// Researches recent market news with web search, then asks Claude, acting as a financial analyst,
     /// for a buy/sell/hold recommendation on every investment (Cash is described but not rated).
@@ -192,11 +264,15 @@ extension PortfolioStore {
     ///   - additionalInstructions: The user's optional notes; left out of the prompt entirely when blank.
     ///   - termsExplainedToday: Terms earlier analyses today already explained, so they aren't explained again.
     ///   - feedback: The user's likes, dislikes and comments on earlier analyses, newest first.
-    ///   - progress: Advanced by one unit after each request (research, then analysis), for the system's background progress UI.
+    ///   - earlierResearch: Today's research from an earlier run; when set, the web isn't searched again and
+    ///     Claude is told when the notes were gathered.
+    ///   - progress: One unit for research and one for writing, each advanced steadily as Claude streams,
+    ///     for the system's background progress UI.
     func analyseMarket(
         additionalInstructions: String,
         termsExplainedToday: [String] = [],
         feedback: [AnalysisFeedback] = [],
+        earlierResearch: EarlierResearch? = nil,
         progress: Progress? = nil
     ) async -> Result<MarketAnalysis, ClaudeFailure> {
         guard hasAPIKey else { return .failure(.missingKey) }
@@ -212,25 +288,44 @@ extension PortfolioStore {
         marketAnalysisActivity = []
         defer { marketAnalysisPhase = nil }
 
-        // Research is one unit of the overall progress, filled in a little per web search
-        let searchProgress = progress.map {
-            Progress(totalUnitCount: Int64(Self.maxResearchSearches), parent: $0, pendingUnitCount: 1)
+        // Research and writing are one unit each of the overall progress. Each moves on every streamed event
+        // (more per search), so iOS sees steady progress and doesn't treat the background task as stuck.
+        let researchProgress = progress.map {
+            Progress(totalUnitCount: AnalysisActivityRecorder.stepUnits, parent: $0, pendingUnitCount: 1)
         }
-        let recorder = AnalysisActivityRecorder(store: self, searchProgress: searchProgress)
+        let recorder = AnalysisActivityRecorder(store: self, stepProgress: researchProgress)
+        recorder.startHeartbeat()
+        defer { recorder.stopHeartbeat() }
 
         let research: ClaudeAPI.Research
-        switch await ClaudeAPI.research(
-            researchPrompt(snapshots, date: date), maxSearches: Self.maxResearchSearches,
-            http: http, apiKey: claudeAPIKey, onEvent: recorder.record
-        ) {
-        case .success(let value): research = value
-        case .failure(let failure): return .failure(failure)
+        let researchDate: Date
+        if let earlierResearch {
+            // Today's research already exists: reuse it instead of searching (and paying for) the web again
+            research = ClaudeAPI.Research(notes: earlierResearch.notes, sources: earlierResearch.sources)
+            researchDate = earlierResearch.date
+            recorder.reuseResearch(from: earlierResearch.date)
+            ClaudeLog.logger.info("Reusing research from \(earlierResearch.date.formatted(), privacy: .public)")
+        } else {
+            switch await ClaudeAPI.research(
+                researchPrompt(snapshots, date: date), maxSearches: Self.maxResearchSearches,
+                http: http, apiKey: claudeAPIKey, onEvent: recorder.record
+            ) {
+            case .success(let value): research = value
+            case .failure(let failure):
+                ClaudeLog.logger.error("Market analysis failed while researching: \(failure.message, privacy: .public)")
+                return .failure(.during(step: "Researching the market", failure))
+            }
+            researchDate = date
+            ClaudeLog.logger.info("Research done: \(research.notes.count, privacy: .public) characters of notes, \(research.sources.count, privacy: .public) sources")
         }
-        searchProgress?.completedUnitCount = Int64(Self.maxResearchSearches)
+        researchProgress?.completedUnitCount = AnalysisActivityRecorder.stepUnits
 
         marketAnalysisPhase = .analysing
-        recorder.begin(.analysing)
-        defer { progress?.completedUnitCount += 1 }
+        let writingProgress = progress.map {
+            Progress(totalUnitCount: AnalysisActivityRecorder.stepUnits, parent: $0, pendingUnitCount: 1)
+        }
+        recorder.beginWriting(stepProgress: writingProgress)
+        defer { writingProgress?.completedUnitCount = AnalysisActivityRecorder.stepUnits }
 
         struct Response: Decodable {
             let summary: String
@@ -242,27 +337,59 @@ extension PortfolioStore {
                 let reason: String
             }
         }
+        // The API enforces this schema (structured outputs); descriptions repeat the prompt's rules per field
         let schema = ClaudeAPI.object([
-            "summary": ["type": "string"],
+            "summary": [
+                "type": "string",
+                "description": "Short market analysis in Markdown (### sections, bullets, bold), as the prompt describes."
+            ],
             "recommendations": [
                 "type": "array",
+                "description": "Exactly one item per numbered investment (1 to \(snapshots.count)), in list order.",
                 "items": ClaudeAPI.object([
-                    "investment": ["type": "integer"],
-                    "recommendation": ["type": "string", "enum": RecommendationAction.allCases.map(\.rawValue)],
-                    "reason": ["type": "string"]
+                    "investment": [
+                        "type": "integer",
+                        "description": "The investment's list number, from 1 to \(snapshots.count)."
+                    ],
+                    "recommendation": [
+                        "type": "string",
+                        "enum": RecommendationAction.allCases.map(\.rawValue),
+                        "description": "buy, sell or hold, in lowercase."
+                    ],
+                    "reason": [
+                        "type": "string",
+                        "description": "Markdown bullets, deciding factor in bold first: two to four for buy or sell, one for hold."
+                    ]
                 ])
             ],
-            "explainedTerms": ["type": "array", "items": ["type": "string"]]
+            "explainedTerms": [
+                "type": "array",
+                "items": ["type": "string"],
+                "description": "Terms explained in plain words in this response, as written; empty if none."
+            ]
         ])
 
         let prompt = analysisPrompt(
-            portfolio: portfolio, research: research, date: date,
+            portfolio: portfolio, research: research, researchDate: researchDate, date: date,
+            investmentCount: snapshots.count,
             instructions: instructions, termsExplainedToday: termsExplainedToday, feedback: feedback
         )
         let result = await ClaudeAPI.streamJSON(
             [["type": "text", "text": prompt]], schema: schema, as: Response.self,
             maxTokens: 32000, http: http, apiKey: claudeAPIKey, onEvent: recorder.record
         )
+        .mapError { failure -> ClaudeFailure in
+            ClaudeLog.logger.error("Market analysis failed while writing recommendations: \(failure.message, privacy: .public)")
+            return .during(step: "Writing recommendations", failure)
+        }
+
+        if case .success(let response) = result {
+            let returned = Set(response.recommendations.map(\.investment))
+            let missing = snapshots.indices.map { $0 + 1 }.filter { !returned.contains($0) }
+            if !missing.isEmpty {
+                ClaudeLog.logger.notice("Claude left out investments \(missing.map(String.init).joined(separator: ", "), privacy: .public)")
+            }
+        }
 
         return result.map { response in
             // One recommendation per investment; unknown list numbers and repeats are dropped
@@ -282,7 +409,9 @@ extension PortfolioStore {
                 explainedTerms: response.explainedTerms,
                 sources: research.sources,
                 userInstructions: instructions.isEmpty ? nil : instructions,
-                portfolioValueGBP: totalValue
+                portfolioValueGBP: totalValue,
+                researchNotes: research.notes,
+                researchDate: researchDate
             )
         }
     }
@@ -330,19 +459,18 @@ extension PortfolioStore {
         let total = investments.reduce(0) { $0 + unfilteredValueInGBP($1) }
         let byID = Dictionary(uniqueKeysWithValues: investments.map { ($0.id, $0) })
 
+        // One compact line per investment; the legend above the list explains the fields once
         let investmentLines = snapshots.enumerated().map { index, snapshot -> String in
             guard let investment = byID[snapshot.id] else { return "" }
             let price: String = switch priceStatus(for: investment) {
-            case .live: snapshot.price.map { "\($0) \(snapshot.currencyCode)" } ?? "unknown"
-            case .manual: snapshot.price.map { "\($0) \(snapshot.currencyCode) (entered manually)" } ?? "value entered manually"
-            case .noLivePrice: "no live price (value may be out of date)"
+            case .live: snapshot.price.map { "\(Self.compact($0)) \(snapshot.currencyCode)" } ?? "price unknown"
+            case .manual: snapshot.price.map { "\(Self.compact($0)) \(snapshot.currencyCode) (manual)" } ?? "manual value"
+            case .noLivePrice: "no live price"
             }
-            return """
-            \(index + 1). \(snapshot.name) (\(snapshot.symbol ?? "no symbol")) — \(snapshot.category), sector: \(investment.sectorOrDefault)
-               Value: \(Self.gbp(snapshot.valueGBP)) (\(Self.percent(snapshot.portfolioPercentage)) of portfolio) · \
-            Target: \(Self.percent(snapshot.targetPercentage)) · Price: \(price)
-               Holdings: \(holdingsDescription(investment, valueGBP: snapshot.valueGBP))
-            """
+            return "\(index + 1). \(snapshot.name) (\(snapshot.symbol ?? "—")) | \(snapshot.category) | "
+                + "\(investment.sectorOrDefault) | \(Self.gbp(snapshot.valueGBP)) | "
+                + "\(Self.percent(snapshot.portfolioPercentage)) → \(Self.percent(snapshot.targetPercentage)) | "
+                + "\(price) | \(holdingsDescription(investment, valueGBP: snapshot.valueGBP))"
         }
 
         let cashLines = investments.filter(isCash).flatMap { cash in
@@ -356,7 +484,8 @@ extension PortfolioStore {
         return """
         Total value: \(Self.gbp(total))
 
-        Investments:
+        Investments — number. name (symbol) | category | sector | value in GBP | current % of portfolio → target % \
+        | price | holdings per broker and account type (units, GBP value):
         \(investmentLines.isEmpty ? "(none)" : investmentLines.joined(separator: "\n"))
 
         Uninvested cash:
@@ -364,14 +493,19 @@ extension PortfolioStore {
         """
     }
 
-    /// e.g. "Trading 212 ISA: 5 units (£750); Revolut Invest: 2 units (£300)"
+    /// e.g. "Trading 212 ISA 5 (£750); Revolut Invest 2.5 (£300)"
     private func holdingsDescription(_ investment: Investment, valueGBP: Double) -> String {
-        guard !investment.holdings.isEmpty else { return "(no holdings recorded)" }
+        guard !investment.holdings.isEmpty else { return "no holdings recorded" }
         let total = investment.totalShares
         return investment.holdings.map { holding in
             let value = total > 0 ? valueGBP * holding.shares / total : 0
-            return "\(holding.broker) \(holding.accountType): \(holding.shares.formatted()) units (\(Self.gbp(value)))"
+            return "\(holding.broker) \(holding.accountType) \(Self.compact(holding.shares)) (\(Self.gbp(value)))"
         }.joined(separator: "; ")
+    }
+
+    /// A number with up to 6 significant digits, e.g. 12.80484953 → "12.8048", 22785946.54 → "22785900".
+    private static func compact(_ value: Double) -> String {
+        value.formatted(.number.precision(.significantDigits(1...6)).grouping(.never))
     }
 
     // MARK: - Prompts
@@ -404,10 +538,16 @@ extension PortfolioStore {
 
         Rely on reputable sources: major bank research notes, Morningstar, TipRanks/MarketBeat aggregated consensus, \
         established financial news (Reuters, Bloomberg, Financial Times, CNBC) and company filings. \
-        Spend more of your searches on the larger positions.
+        You have a budget of \(Self.maxResearchSearches) web searches for this research; any beyond that will fail. \
+        Plan them across the \(snapshots.count) holdings and the macro picture: use broad searches that cover several \
+        holdings at once (e.g. sector or index news), give the larger positions their own searches, and stop once \
+        you have enough — you don't have to use the whole budget.
 
-        Write concise, factual notes grouped by holding, then macro, then areas outside the portfolio. \
-        Give the date and source of each point. Don't make recommendations — just report what you found.
+        Write compact, factual bullet notes — they're read by an analyst, not shown to me, so skip introductions, \
+        summaries and repetition. Group them by holding, then macro, then areas outside the portfolio. Use about \
+        40–80 words per holding, more only for genuinely major news; for a holding with nothing material, write just \
+        "no material news". Give the date and source of each point (e.g. "Reuters, 16 Oct"). Don't make \
+        recommendations — just report what you found.
 
         Holdings (largest first):
         \(holdings.isEmpty ? "(none)" : holdings)
@@ -418,12 +558,19 @@ extension PortfolioStore {
     private func analysisPrompt(
         portfolio: String,
         research: ClaudeAPI.Research,
+        researchDate: Date,
         date: Date,
+        investmentCount: Int,
         instructions: String,
         termsExplainedToday: [String],
         feedback: [AnalysisFeedback]
     ) -> String {
-        let sources = research.sources.map { "- \($0.title) — \($0.url)" }.joined(separator: "\n")
+        // Reused research is from earlier today; say when, so Claude weighs how fresh it is
+        let isReused = date.timeIntervalSince(researchDate) > 60
+        let researchTime = researchDate.formatted(date: .omitted, time: .shortened)
+        let researchSource = isReused
+            ? "gathered from the web earlier today at \(researchTime) and not refreshed for this analysis — news after \(researchTime) isn't covered"
+            : "gathered from the web today"
         let alreadyExplained = termsExplainedToday.isEmpty
             ? ""
             : "\n  Terms already explained to me earlier today (don't explain these again): \(termsExplainedToday.joined(separator: ", "))"
@@ -444,7 +591,7 @@ extension PortfolioStore {
         above its target can still be a buy if its outlook is strong, even though that widens the gap. When your \
         recommendation goes against the target gap, say so briefly in the reason.
         - My targets don't have to add up to exactly 100%. Ignore that and give directional buy/sell/hold guidance regardless.
-        - Base your view on the research notes below, gathered from the web today. Rely on reputable sources (major \
+        - Base your view on the research notes below, \(researchSource). Rely on reputable sources (major \
         bank research notes, Morningstar, TipRanks/MarketBeat aggregated consensus) and name the source when a point \
         rests on it. Don't invent facts, figures or sources that aren't in the notes.
 
@@ -456,14 +603,22 @@ extension PortfolioStore {
           - "rate hike" → "raised interest rates", plus one clause on what that generally means (borrowing gets more \
         expensive, which tends to cool inflation but also cool stock and gold prices)\(alreadyExplained)
 
-        What to return:
-        - summary: a short analysis (a few sentences) of the last few days in the market — the news that matters for my \
-        portfolio (regulatory rulings, litigation, M&A, product launches, guidance changes, macro data releases) and \
-        upcoming or recent company-specific events. Explain how this affects my portfolio (the biggest mover, the most \
-        important portfolio-related news, any earnings) and which areas outside my portfolio I should start considering.
-        - recommendations: exactly one per numbered investment below. "investment" is its list number, \
-        "recommendation" is buy, sell or hold, and "reason" briefly summarises why.
-        - explainedTerms: every term or acronym you explained in plain words in this response, as you wrote it (e.g. "the Fed").
+        Response format — your reply is read by an app, so it must be a single JSON object with exactly these three \
+        fields and nothing before or after it:
+        - "summary" (string): a short analysis (a few sentences) of the last few days in the market — the news that \
+        matters for my portfolio (regulatory rulings, litigation, M&A, product launches, guidance changes, macro data \
+        releases) and upcoming or recent company-specific events. Explain how this affects my portfolio (the biggest \
+        mover, the most important portfolio-related news, any earnings) and which areas outside my portfolio I should \
+        start considering.
+        - "recommendations" (array): exactly \(investmentCount) items, one for each numbered investment below, in list \
+        order. Each item has:
+          - "investment" (integer): the investment's list number, from 1 to \(investmentCount). Only numbers from the \
+        list — uninvested cash isn't numbered and gets no recommendation.
+          - "recommendation" (string): exactly "buy", "sell" or "hold", in lowercase.
+          - "reason" (string): why, briefly.
+        - "explainedTerms" (array of strings): every term or acronym you explained in plain words in this response, \
+        as you wrote it (e.g. "the Fed"). Use an empty array if you explained none.
+        Line breaks inside the Markdown text are part of the JSON string, written as \\n.
 
         Formatting (summary and reason are shown on phone-sized cards, rendered as Markdown):
         - Use only this Markdown: **bold**, *italics*, bullet lists ("- "), "### " headings, and [links](https://…) to sources.
@@ -471,23 +626,29 @@ extension PortfolioStore {
         - summary: open with one or two plain sentences on the overall picture, then short "### " sections such as \
         "### Biggest mover", "### Portfolio news", "### Earnings" and "### Worth considering", each with a sentence or \
         a few short bullets. Leave out sections with nothing to say.
-        - reason: two to four short bullets, with the deciding factor in **bold** first. If the recommendation goes \
-        against the target gap, give that its own bullet.
+        - reason for a buy or sell: two to four short bullets, with the deciding factor in **bold** first. If the \
+        recommendation goes against the target gap, give that its own bullet.
+        - reason for a hold: one short bullet with the deciding factor in **bold** — holds are hidden unless I ask \
+        for them, so keep these brief.
         - Keep it concise. Bold the few words that matter most, not whole sentences.
 
         \(Self.feedbackSection(feedback))My portfolio:
         \(portfolio)
 
-        Research notes:
+        Research notes (\(isReused ? "from \(researchTime) today" : "from today")):
         \(research.notes)
-
-        Sources consulted:
-        \(sources.isEmpty ? "(none listed)" : sources)
         """
 
         if !instructions.isEmpty {
             prompt += "\n\nAdditional instructions from me: \(instructions)"
         }
+        // Last, after the long data and any notes, so the format holds whatever came before
+        prompt += """
+
+
+        Reply with the JSON object only: "summary", "recommendations" (exactly \(investmentCount) items, numbers 1 to \
+        \(investmentCount)) and "explainedTerms".
+        """
         return prompt
     }
 
@@ -526,7 +687,7 @@ extension PortfolioStore {
     }
 
     /// A single-line, shortened quote of earlier Markdown output.
-    private static func excerpt(_ text: String, maxLength: Int = 300) -> String {
+    private static func excerpt(_ text: String, maxLength: Int = 150) -> String {
         let flattened = text
             .components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespaces) }
